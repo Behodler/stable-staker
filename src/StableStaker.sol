@@ -1,0 +1,400 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import "flax-token/IFlax.sol";
+import "pauser/interfaces/IPausable.sol";
+
+/**
+ * @title StableStaker
+ * @notice A MasterChef-style yield farm that supports any number of staked (stable) tokens and
+ *         rewards stakers in phUSD. Unlike a classic MasterChef, rewards are not paid from a
+ *         pre-funded balance: the contract is an authorized minter of phUSD and mints rewards
+ *         directly to users on claim / withdraw / migration.
+ *
+ * @dev Reward accounting is the canonical per-pool MasterChef model, one pool per token:
+ *
+ *        accPhusdPerShare += elapsed * phusdPerSecond * ACC_PRECISION / totalStaked
+ *        pending(user)     = user.amount * accPhusdPerShare / ACC_PRECISION - user.rewardDebt
+ *
+ *      Emission-cap invariant (the core safety property): the only writer of `accPhusdPerShare`
+ *      is {_updatePool}, which folds in exactly `elapsed * phusdPerSecond` of value per update.
+ *      The sum of every staker's pending increase therefore equals that amount minus
+ *      integer-division dust, *independent of how stake is split or churned*. Consequences:
+ *        - flash staking (stake + exit in one block) yields elapsed == 0 -> 0 reward;
+ *        - windows where `totalStaked == 0` accrue nothing (lastRewardTime is fast-forwarded);
+ *        - dust always rounds DOWN, so realized emission <= phusdPerSecond * elapsed.
+ *      Hence no sequence of user actions can mint more than `phUSDPerDay` for a token over any
+ *      window. {phUSDPerDay} settles the pool at the old rate before changing it, so a rate
+ *      change is never applied retroactively.
+ *
+ *      Pausing follows the Behodler3 pattern (OZ {Pausable} + {IPausable}): a dedicated `pauser`
+ *      address pauses; owner OR pauser unpauses. The {emergencyWithdraw} escape hatch and the
+ *      migration hooks intentionally remain callable while paused.
+ */
+contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
+    using SafeERC20 for IERC20;
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    /// @notice Fixed-point scaling factor for `accPhusdPerShare`. Dust rounds down.
+    uint256 public constant ACC_PRECISION = 1e18;
+
+    /// @notice Seconds in a day, used to convert a per-day budget into a per-second rate.
+    uint256 public constant SECONDS_PER_DAY = 86400;
+
+    /// @notice The phUSD reward token. This contract must be an authorized minter on it.
+    IFlax public immutable phUSD;
+
+    /// @notice Address authorized to pause the contract (Behodler3 pattern). Satisfies IPausable.
+    address public override pauser;
+
+    /// @notice Address authorized to perform permissioned migration (migrateOut / depositFor).
+    address public migrator;
+
+    /// @notice Per-token reward pool accounting.
+    struct PoolInfo {
+        bool exists; // whether the token has been registered as a pool
+        uint256 phusdPerSecond; // current emission rate (phUSD wei per second)
+        uint256 accPhusdPerShare; // accumulated phUSD per staked unit, scaled by ACC_PRECISION
+        uint256 lastRewardTime; // last time the pool accrued
+        uint256 totalStaked; // total principal staked in this pool
+    }
+
+    /// @notice Per-user position within a pool.
+    struct UserInfo {
+        uint256 amount; // staked principal
+        uint256 rewardDebt; // accounting baseline: amount * accPhusdPerShare / ACC_PRECISION at last settle
+    }
+
+    /// @notice token => pool accounting.
+    mapping(address => PoolInfo) public poolInfo;
+
+    /// @notice token => user => position.
+    mapping(address => mapping(address => UserInfo)) public userInfo;
+
+    /// @notice token => enumerable set of addresses currently holding a non-zero position.
+    mapping(address => EnumerableSet.AddressSet) private _stakers;
+
+    /// @notice List of every registered pool token.
+    address[] public stakedTokens;
+
+    // ============================== EVENTS ==============================
+
+    event TokenAdded(address indexed token);
+    event RewardRateSet(address indexed token, uint256 phusdPerDay, uint256 phusdPerSecond);
+    event MigratorSet(address indexed migrator);
+    event PauserUpdated(address indexed oldPauser, address indexed newPauser);
+    event Staked(address indexed token, address indexed user, uint256 amount);
+    event Withdrawn(address indexed token, address indexed user, uint256 amount);
+    event Claimed(address indexed token, address indexed user, uint256 reward);
+    event EmergencyWithdrawn(address indexed token, address indexed user, uint256 amount);
+    event MigratedOut(address indexed token, address indexed user, uint256 amount, uint256 reward);
+    event DepositedFor(address indexed token, address indexed user, uint256 amount);
+
+    // ============================== MODIFIERS ==============================
+
+    modifier onlyPauser() {
+        require(msg.sender == pauser, "StableStaker: only pauser");
+        _;
+    }
+
+    modifier onlyMigrator() {
+        require(msg.sender == migrator, "StableStaker: only migrator");
+        _;
+    }
+
+    modifier poolExists(address token) {
+        require(poolInfo[token].exists, "StableStaker: unknown token");
+        _;
+    }
+
+    // ============================== CONSTRUCTOR ==============================
+
+    /**
+     * @param _phUSD       The phUSD token this farm mints as rewards.
+     * @param initialOwner The owner (can register tokens, set rates, migrator and pauser).
+     */
+    constructor(IFlax _phUSD, address initialOwner) Ownable(initialOwner) {
+        require(address(_phUSD) != address(0), "StableStaker: zero phUSD");
+        phUSD = _phUSD;
+    }
+
+    // ============================== OWNER CONFIG ==============================
+
+    /// @notice Register a new stable token as a reward pool.
+    function addToken(address token) external onlyOwner {
+        require(token != address(0), "StableStaker: zero token");
+        PoolInfo storage pool = poolInfo[token];
+        require(!pool.exists, "StableStaker: token exists");
+        pool.exists = true;
+        pool.lastRewardTime = block.timestamp;
+        stakedTokens.push(token);
+        emit TokenAdded(token);
+    }
+
+    /**
+     * @notice Set the daily phUSD emission budget for a token. Internally converted to a
+     *         per-second rate (`amountPerDay / SECONDS_PER_DAY`, rounded down). The pool is
+     *         settled at the existing rate first so the change never applies retroactively.
+     */
+    function phUSDPerDay(address token, uint256 amountPerDay) external onlyOwner poolExists(token) {
+        _updatePool(token);
+        uint256 perSecond = amountPerDay / SECONDS_PER_DAY;
+        poolInfo[token].phusdPerSecond = perSecond;
+        emit RewardRateSet(token, amountPerDay, perSecond);
+    }
+
+    /// @notice Set the address authorized to perform permissioned migration.
+    function setMigrator(address _migrator) external onlyOwner {
+        migrator = _migrator;
+        emit MigratorSet(_migrator);
+    }
+
+    /// @notice Set (or clear, with address(0)) the pauser address.
+    function setPauser(address _pauser) external onlyOwner {
+        address old = pauser;
+        pauser = _pauser;
+        emit PauserUpdated(old, _pauser);
+    }
+
+    // ============================== PAUSING (IPausable) ==============================
+
+    /// @inheritdoc IPausable
+    function pause() external override onlyPauser {
+        _pause();
+    }
+
+    /// @inheritdoc IPausable
+    function unpause() external override {
+        require(msg.sender == owner() || msg.sender == pauser, "StableStaker: only owner or pauser");
+        _unpause();
+    }
+
+    // ============================== STAKING ==============================
+
+    /// @notice Stake `amount` of `token`. Any pending reward is minted to the caller first.
+    function stake(address token, uint256 amount) external nonReentrant whenNotPaused poolExists(token) {
+        require(amount > 0, "StableStaker: amount=0");
+        PoolInfo storage pool = poolInfo[token];
+        _updatePool(token);
+        UserInfo storage user = userInfo[token][msg.sender];
+        _settle(msg.sender, user, pool);
+
+        uint256 received = _pullToken(token, msg.sender, amount);
+        user.amount += received;
+        pool.totalStaked += received;
+        user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
+        _stakers[token].add(msg.sender);
+        emit Staked(token, msg.sender, received);
+    }
+
+    /// @notice Withdraw `amount` of staked `token`. Any pending reward is minted to the caller.
+    function withdraw(address token, uint256 amount) external nonReentrant whenNotPaused poolExists(token) {
+        require(amount > 0, "StableStaker: amount=0");
+        PoolInfo storage pool = poolInfo[token];
+        UserInfo storage user = userInfo[token][msg.sender];
+        require(user.amount >= amount, "StableStaker: insufficient stake");
+        _updatePool(token);
+
+        uint256 pending = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION - user.rewardDebt;
+        user.amount -= amount;
+        pool.totalStaked -= amount;
+        user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
+        if (user.amount == 0) {
+            _stakers[token].remove(msg.sender);
+        }
+
+        if (pending > 0) {
+            phUSD.mint(msg.sender, pending);
+        }
+        IERC20(token).safeTransfer(msg.sender, amount);
+        emit Withdrawn(token, msg.sender, amount);
+    }
+
+    /// @notice Mint the caller's pending phUSD reward for `token` without touching principal.
+    function claim(address token) external nonReentrant whenNotPaused poolExists(token) {
+        PoolInfo storage pool = poolInfo[token];
+        _updatePool(token);
+        UserInfo storage user = userInfo[token][msg.sender];
+        uint256 pending = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION - user.rewardDebt;
+        require(pending > 0, "StableStaker: nothing to claim");
+        user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
+        phUSD.mint(msg.sender, pending);
+        emit Claimed(token, msg.sender, pending);
+    }
+
+    /**
+     * @notice Escape hatch: withdraw the caller's full principal for `token`, forfeiting any
+     *         pending reward. Works while paused and never touches reward accounting, so a
+     *         broken mint path can never trap principal.
+     */
+    function emergencyWithdraw(address token) external nonReentrant {
+        UserInfo storage user = userInfo[token][msg.sender];
+        uint256 amount = user.amount;
+        require(amount > 0, "StableStaker: nothing staked");
+        user.amount = 0;
+        user.rewardDebt = 0;
+        poolInfo[token].totalStaked -= amount;
+        _stakers[token].remove(msg.sender);
+        IERC20(token).safeTransfer(msg.sender, amount);
+        emit EmergencyWithdrawn(token, msg.sender, amount);
+    }
+
+    // ============================== MIGRATION ==============================
+
+    /**
+     * @notice Permissioned batched exit (see {IStableStaker-migrateOut}). Settles and mints each
+     *         user's pending reward, zeroes their position, and transfers the aggregate principal
+     *         to the migrator. Callable while paused so a migration can proceed during an incident.
+     */
+    function migrateOut(address token, address[] calldata users)
+        external
+        nonReentrant
+        onlyMigrator
+        poolExists(token)
+        returns (uint256[] memory amounts)
+    {
+        PoolInfo storage pool = poolInfo[token];
+        _updatePool(token);
+        amounts = new uint256[](users.length);
+        uint256 totalPrincipal;
+        for (uint256 i = 0; i < users.length; i++) {
+            address u = users[i];
+            UserInfo storage info = userInfo[token][u];
+            uint256 amt = info.amount;
+            if (amt == 0) {
+                continue;
+            }
+            uint256 pending = (amt * pool.accPhusdPerShare) / ACC_PRECISION - info.rewardDebt;
+            info.amount = 0;
+            info.rewardDebt = 0;
+            pool.totalStaked -= amt;
+            _stakers[token].remove(u);
+            amounts[i] = amt;
+            totalPrincipal += amt;
+            if (pending > 0) {
+                phUSD.mint(u, pending);
+            }
+            emit MigratedOut(token, u, amt, pending);
+        }
+        if (totalPrincipal > 0) {
+            IERC20(token).safeTransfer(msg.sender, totalPrincipal);
+        }
+    }
+
+    /**
+     * @notice Permissioned deposit crediting `user` (see {IStableStaker-depositFor}). Pulls
+     *         `amount` of `token` from the migrator. Callable while paused so a freshly deployed
+     *         (and possibly paused) target can be seeded.
+     */
+    function depositFor(address token, address user, uint256 amount)
+        external
+        nonReentrant
+        onlyMigrator
+        poolExists(token)
+    {
+        require(amount > 0, "StableStaker: amount=0");
+        PoolInfo storage pool = poolInfo[token];
+        _updatePool(token);
+        UserInfo storage info = userInfo[token][user];
+        _settle(user, info, pool);
+
+        uint256 received = _pullToken(token, msg.sender, amount);
+        info.amount += received;
+        pool.totalStaked += received;
+        info.rewardDebt = (info.amount * pool.accPhusdPerShare) / ACC_PRECISION;
+        _stakers[token].add(user);
+        emit DepositedFor(token, user, received);
+    }
+
+    // ============================== VIEWS ==============================
+
+    /// @notice Projected pending phUSD reward for `account` in `token`'s pool.
+    function pendingReward(address token, address account) external view returns (uint256) {
+        PoolInfo storage pool = poolInfo[token];
+        uint256 acc = pool.accPhusdPerShare;
+        if (block.timestamp > pool.lastRewardTime && pool.totalStaked > 0) {
+            uint256 elapsed = block.timestamp - pool.lastRewardTime;
+            uint256 reward = elapsed * pool.phusdPerSecond;
+            acc += (reward * ACC_PRECISION) / pool.totalStaked;
+        }
+        UserInfo storage user = userInfo[token][account];
+        return (user.amount * acc) / ACC_PRECISION - user.rewardDebt;
+    }
+
+    /// @notice All stakers with a non-zero position in `token`.
+    function getStakers(address token) external view returns (address[] memory) {
+        return _stakers[token].values();
+    }
+
+    /**
+     * @notice A half-open slice `[start, end)` of `token`'s staker set, for paging. `end` is
+     *         clamped to the set length, so passing a large `end` returns through the last entry.
+     */
+    function getStakersRange(address token, uint256 start, uint256 end) external view returns (address[] memory) {
+        EnumerableSet.AddressSet storage set = _stakers[token];
+        uint256 len = set.length();
+        if (end > len) {
+            end = len;
+        }
+        require(start <= end, "StableStaker: bad range");
+        address[] memory out = new address[](end - start);
+        for (uint256 i = start; i < end; i++) {
+            out[i - start] = set.at(i);
+        }
+        return out;
+    }
+
+    /// @notice Number of stakers with a non-zero position in `token`.
+    function stakerCount(address token) external view returns (uint256) {
+        return _stakers[token].length();
+    }
+
+    /// @notice Every registered pool token.
+    function getStakedTokens() external view returns (address[] memory) {
+        return stakedTokens;
+    }
+
+    // ============================== INTERNAL ==============================
+
+    /// @dev Accrue rewards for `token` up to the current block. Empty pools accrue nothing.
+    function _updatePool(address token) internal {
+        PoolInfo storage pool = poolInfo[token];
+        if (block.timestamp <= pool.lastRewardTime) {
+            return;
+        }
+        if (pool.totalStaked == 0) {
+            pool.lastRewardTime = block.timestamp;
+            return;
+        }
+        uint256 elapsed = block.timestamp - pool.lastRewardTime;
+        uint256 reward = elapsed * pool.phusdPerSecond;
+        if (reward > 0) {
+            pool.accPhusdPerShare += (reward * ACC_PRECISION) / pool.totalStaked;
+        }
+        pool.lastRewardTime = block.timestamp;
+    }
+
+    /// @dev Mint any outstanding pending reward for an existing position. Assumes pool is current.
+    function _settle(address account, UserInfo storage user, PoolInfo storage pool) internal {
+        if (user.amount > 0) {
+            uint256 pending = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION - user.rewardDebt;
+            if (pending > 0) {
+                phUSD.mint(account, pending);
+            }
+        }
+    }
+
+    /// @dev Pull `amount` of `token` from `from`, returning the actual amount received.
+    function _pullToken(address token, address from, uint256 amount) internal returns (uint256) {
+        IERC20 t = IERC20(token);
+        uint256 balanceBefore = t.balanceOf(address(this));
+        t.safeTransferFrom(from, address(this), amount);
+        return t.balanceOf(address(this)) - balanceBefore;
+    }
+}

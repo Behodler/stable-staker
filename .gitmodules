@@ -1,0 +1,12 @@
+[submodule "lib/openzeppelin-contracts"]
+	path = lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
+[submodule "lib/forge-std"]
+	path = lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "lib/flax-token"]
+	path = lib/flax-token
+	url = git@github.com:Behodler/flax-token-v2.git
+[submodule "lib/pauser"]
+	path = lib/pauser
+	url = git@github.com:Behodler/pauser.git
