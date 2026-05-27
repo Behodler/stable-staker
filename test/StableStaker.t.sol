@@ -59,7 +59,7 @@ contract StableStakerTest is Test {
         _stake(alice, address(usdc), 100e6);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 100e6);
-        (,,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
         assertEq(totalStaked, 100e6);
         assertEq(staker.stakerCount(address(usdc)), 1);
         address[] memory s = staker.getStakers(address(usdc));

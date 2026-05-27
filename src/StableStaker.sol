@@ -58,7 +58,6 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
 
     /// @notice Per-token reward pool accounting.
     struct PoolInfo {
-        bool exists; // whether the token has been registered as a pool
         uint256 phusdPerSecond; // current emission rate (phUSD wei per second)
         uint256 accPhusdPerShare; // accumulated phUSD per staked unit, scaled by ACC_PRECISION
         uint256 lastRewardTime; // last time the pool accrued
@@ -80,8 +79,8 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     /// @notice token => enumerable set of addresses currently holding a non-zero position.
     mapping(address => EnumerableSet.AddressSet) private _stakers;
 
-    /// @notice List of every registered pool token.
-    address[] public stakedTokens;
+    /// @notice Set of every registered pool token.
+    EnumerableSet.AddressSet private _registeredTokens;
 
     // ============================== EVENTS ==============================
 
@@ -109,7 +108,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     }
 
     modifier poolExists(address token) {
-        require(poolInfo[token].exists, "StableStaker: unknown token");
+        require(_registeredTokens.contains(token), "StableStaker: unknown token");
         _;
     }
 
@@ -129,11 +128,8 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     /// @notice Register a new stable token as a reward pool.
     function addToken(address token) external onlyOwner {
         require(token != address(0), "StableStaker: zero token");
-        PoolInfo storage pool = poolInfo[token];
-        require(!pool.exists, "StableStaker: token exists");
-        pool.exists = true;
-        pool.lastRewardTime = block.timestamp;
-        stakedTokens.push(token);
+        require(_registeredTokens.add(token), "StableStaker: token exists");
+        poolInfo[token].lastRewardTime = block.timestamp;
         emit TokenAdded(token);
     }
 
@@ -357,7 +353,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
 
     /// @notice Every registered pool token.
     function getStakedTokens() external view returns (address[] memory) {
-        return stakedTokens;
+        return _registeredTokens.values();
     }
 
     // ============================== INTERNAL ==============================

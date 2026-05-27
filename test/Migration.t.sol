@@ -76,7 +76,7 @@ contract MigrationTest is Test {
         (uint256 bOld,) = oldStaker.userInfo(address(usdc), bob);
         assertEq(aOld, 0);
         assertEq(bOld, 0);
-        (,,,, uint256 oldTotal) = oldStaker.poolInfo(address(usdc));
+        (,,, uint256 oldTotal) = oldStaker.poolInfo(address(usdc));
         assertEq(oldTotal, 0);
         assertEq(oldStaker.stakerCount(address(usdc)), 0);
         assertEq(usdc.balanceOf(address(oldStaker)), 0);
@@ -90,7 +90,7 @@ contract MigrationTest is Test {
         (uint256 bNew,) = newStaker.userInfo(address(usdc), bob);
         assertEq(aNew, 100e6);
         assertEq(bNew, 300e6);
-        (,,,, uint256 newTotal) = newStaker.poolInfo(address(usdc));
+        (,,, uint256 newTotal) = newStaker.poolInfo(address(usdc));
         assertEq(newTotal, 400e6);
         assertEq(newStaker.stakerCount(address(usdc)), 2);
         assertEq(usdc.balanceOf(address(newStaker)), 400e6);
