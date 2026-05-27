@@ -10,3 +10,7 @@
 [submodule "lib/pauser"]
 	path = lib/pauser
 	url = git@github.com:Behodler/pauser.git
+[submodule "lib/reflax-yield-vault"]
+	path = lib/reflax-yield-vault
+	url = https://github.com/Behodler/reflax-yield-vault
+	branch = master
