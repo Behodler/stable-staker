@@ -9,6 +9,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "flax-token/IFlax.sol";
 import "pauser/interfaces/IPausable.sol";
+import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 
 /**
  * @title StableStaker
@@ -82,12 +83,18 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     /// @notice Set of every registered pool token.
     EnumerableSet.AddressSet private _registeredTokens;
 
+    /// @notice token => yield strategy that custodies its principal. address(0) ⇒ held idle in-contract.
+    /// @dev Principal-moving paths route through this adapter when set. Reward accounting is unaffected:
+    ///      yield accrued inside the strategy is protocol-owned and never credited to stakers.
+    mapping(address => IYieldStrategy) public yieldStrategy;
+
     // ============================== EVENTS ==============================
 
     event TokenAdded(address indexed token);
     event RewardRateSet(address indexed token, uint256 phusdPerDay, uint256 phusdPerSecond);
     event MigratorSet(address indexed migrator);
     event PauserUpdated(address indexed oldPauser, address indexed newPauser);
+    event YieldStrategySet(address indexed token, address indexed oldStrategy, address indexed newStrategy);
     event Staked(address indexed token, address indexed user, uint256 amount);
     event Withdrawn(address indexed token, address indexed user, uint256 amount);
     event Claimed(address indexed token, address indexed user, uint256 reward);
@@ -158,6 +165,41 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         emit PauserUpdated(old, _pauser);
     }
 
+    /**
+     * @notice Set (or clear, with address(0)) the yield strategy that custodies `token`'s principal.
+     * @dev On set to a non-zero strategy: approves it for unlimited `token` and sweeps any idle balance
+     *      already held by the contract into the new strategy (so subsequent withdrawals resolve against
+     *      it). When clearing or replacing, the old strategy's allowance is reset to 0. Replacing an
+     *      in-use strategy does NOT migrate funds out of the old one (see CLAUDE.md / story Concerns):
+     *      drain the old strategy or replace only while `totalStaked == 0`.
+     *
+     *      Wiring prerequisite: the strategy owner must authorize this contract as a client
+     *      (`strategy.setClient(address(this), true)`) before deposits will succeed.
+     */
+    function setYieldStrategy(address token, IYieldStrategy strategy) external onlyOwner poolExists(token) {
+        IYieldStrategy old = yieldStrategy[token];
+        if (address(old) != address(0)) {
+            // Revoke the old strategy's spending allowance.
+            IERC20(token).forceApprove(address(old), 0);
+        }
+
+        yieldStrategy[token] = strategy;
+
+        if (address(strategy) != address(0)) {
+            // Approve the new strategy to pull this token for deposits.
+            IERC20(token).forceApprove(address(strategy), type(uint256).max);
+
+            // Sweep any idle balance already sitting in the contract into the new strategy so that
+            // accounting is consistent immediately (at first adoption this equals staked principal).
+            uint256 idleBalance = IERC20(token).balanceOf(address(this));
+            if (idleBalance > 0) {
+                strategy.deposit(token, idleBalance, address(this));
+            }
+        }
+
+        emit YieldStrategySet(token, address(old), address(strategy));
+    }
+
     // ============================== PAUSING (IPausable) ==============================
 
     /// @inheritdoc IPausable
@@ -182,6 +224,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         _settle(msg.sender, user, pool);
 
         uint256 received = _pullToken(token, msg.sender, amount);
+        _routeDeposit(token, received);
         user.amount += received;
         pool.totalStaked += received;
         user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
@@ -208,7 +251,10 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         if (pending > 0) {
             phUSD.mint(msg.sender, pending);
         }
-        IERC20(token).safeTransfer(msg.sender, amount);
+        // Non-migrating withdrawals are blocked while the strategy is below par (avoids realising
+        // a loss on a user who did not opt into migration). Forward the measured-received amount.
+        uint256 payout = _routeExit(token, amount, true);
+        IERC20(token).safeTransfer(msg.sender, payout);
         emit Withdrawn(token, msg.sender, amount);
     }
 
@@ -237,7 +283,9 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         user.rewardDebt = 0;
         poolInfo[token].totalStaked -= amount;
         _stakers[token].remove(msg.sender);
-        IERC20(token).safeTransfer(msg.sender, amount);
+        // No underwater guard: the escape hatch must always work, accepting a haircut if below par.
+        uint256 payout = _routeExit(token, amount, false);
+        IERC20(token).safeTransfer(msg.sender, payout);
         emit EmergencyWithdrawn(token, msg.sender, amount);
     }
 
@@ -279,7 +327,10 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
             emit MigratedOut(token, u, amt, pending);
         }
         if (totalPrincipal > 0) {
-            IERC20(token).safeTransfer(msg.sender, totalPrincipal);
+            // Redeem the aggregate principal in a single strategy call (the farm is one client).
+            // No underwater guard: a below-par migration delivers the redeemed (haircut) amount.
+            uint256 payout = _routeExit(token, totalPrincipal, false);
+            IERC20(token).safeTransfer(msg.sender, payout);
         }
     }
 
@@ -301,6 +352,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         _settle(user, info, pool);
 
         uint256 received = _pullToken(token, msg.sender, amount);
+        _routeDeposit(token, received);
         info.amount += received;
         pool.totalStaked += received;
         info.rewardDebt = (info.amount * pool.accPhusdPerShare) / ACC_PRECISION;
@@ -356,6 +408,19 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         return _registeredTokens.values();
     }
 
+    /**
+     * @notice True when non-migrating withdrawals are currently disabled for `token` because its
+     *         yield strategy is below par (`totalBalanceOf < principalOf`). False when no strategy
+     *         is set. Cheap off-chain check before prompting a user to withdraw.
+     */
+    function withdrawDisabled(address token) external view returns (bool) {
+        IYieldStrategy strategy = yieldStrategy[token];
+        if (address(strategy) == address(0)) {
+            return false;
+        }
+        return _isUnderwater(token, strategy);
+    }
+
     // ============================== INTERNAL ==============================
 
     /// @dev Accrue rewards for `token` up to the current block. Empty pools accrue nothing.
@@ -391,6 +456,44 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         IERC20 t = IERC20(token);
         uint256 balanceBefore = t.balanceOf(address(this));
         t.safeTransferFrom(from, address(this), amount);
+        return t.balanceOf(address(this)) - balanceBefore;
+    }
+
+    /// @dev The strategy is below par for the farm's position when its total balance (principal +
+    ///      yield) is worth less than the principal it custodies for this contract.
+    function _isUnderwater(address token, IYieldStrategy strategy) internal view returns (bool) {
+        return strategy.totalBalanceOf(token, address(this)) < strategy.principalOf(token, address(this));
+    }
+
+    /// @dev If a strategy is set for `token`, deposit `amount` into it under this contract's account.
+    ///      No-op (idle hold) when unset. Reward/principal accounting always uses `amount` regardless.
+    function _routeDeposit(address token, uint256 amount) internal {
+        IYieldStrategy strategy = yieldStrategy[token];
+        if (address(strategy) != address(0)) {
+            strategy.deposit(token, amount, address(this));
+        }
+    }
+
+    /**
+     * @dev If a strategy is set for `token`, redeem `amount` of principal from it to this contract
+     *      and return the ACTUAL amount received (balance delta) for forwarding to the user/migrator.
+     *      Internal principal accounting is decremented by the requested `amount` by the caller, not
+     *      the received amount; sub-amount differences remain protocol-owned yield/loss. When no
+     *      strategy is set, returns `amount` unchanged (the tokens already sit in the contract).
+     * @param guardUnderwater When true (the non-migrating `withdraw` path), reverts if the strategy
+     *      is below par. The escape hatch and migration pass false so they always succeed.
+     */
+    function _routeExit(address token, uint256 amount, bool guardUnderwater) internal returns (uint256 payout) {
+        IYieldStrategy strategy = yieldStrategy[token];
+        if (address(strategy) == address(0)) {
+            return amount;
+        }
+        if (guardUnderwater) {
+            require(!_isUnderwater(token, strategy), "StableStaker: strategy underwater");
+        }
+        IERC20 t = IERC20(token);
+        uint256 balanceBefore = t.balanceOf(address(this));
+        strategy.withdraw(token, amount, address(this));
         return t.balanceOf(address(this)) - balanceBefore;
     }
 }

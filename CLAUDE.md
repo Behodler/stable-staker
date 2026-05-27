@@ -36,6 +36,48 @@ per update; the sum of all stakers' pending increase equals that minus integer-d
 For migration, both old and new stakers must have the migrator set (`setMigrator`) and the new
 staker must have the token registered (`addToken`); the new staker must also be a phUSD minter.
 
+## Yield strategies (per-token principal custody)
+
+By default a staked token sits **idle** in the contract. A token can optionally route its principal
+through a per-token `IYieldStrategy` adapter (from the `reflax-yield-vault` submodule) so the
+staked stables earn yield instead of sitting idle. This is opt-in per token via
+`setYieldStrategy(token, strategy)` (`onlyOwner`, `poolExists`); `address(0)` ⇒ idle-hold (the
+original behaviour). All five principal-moving paths (`stake`, `withdraw`, `emergencyWithdraw`,
+`migrateOut`, `depositFor`) route through the strategy when one is set.
+
+**Wiring a strategy (two sides, both required):**
+
+1. **On the strategy** (done by the *strategy's* owner, not `StableStaker`):
+   `strategy.setClient(address(staker), true)`. Until this is done the strategy's
+   `deposit`/`withdraw` revert (`AYieldStrategy: unauthorized, only authorized clients`), so a
+   `stake` into a token whose strategy hasn't authorized the farm will revert.
+2. **On the staker** (owner): `staker.setYieldStrategy(token, strategy)`. This `forceApprove`s the
+   strategy for unlimited `token`, **sweeps any idle balance** already in the contract into the new
+   strategy, and emits `YieldStrategySet`. Clearing or replacing a strategy resets the *old*
+   strategy's allowance to 0. Replacing an in-use strategy does **not** auto-migrate funds out of
+   the old one — drain it first (via the old strategy's owner flow) or replace only while
+   `totalStaked == 0`.
+
+The farm pools all users under a single strategy client account (`recipient = address(this)` for
+both deposit and withdraw); it forwards the redeemed tokens to the real user afterward. Exits
+forward the **actual received** amount (balance delta), while internal principal accounting is
+decremented by the **requested** amount — sub-amount differences remain protocol-owned yield/loss
+(consistent with `ERC4626YieldStrategy`'s rounding rule).
+
+**Yield stays protocol-owned.** Stakers only ever get their *principal* back plus phUSD emissions.
+Reward accounting (`accPhusdPerShare`, `rewardDebt`, `totalStaked`, `_updatePool`, `_settle`) is
+untouched by this routing; the farm never reads `totalBalanceOf` to credit a user. Accrued yield
+accumulates inside the strategy as protocol-owned surplus (skimmed elsewhere via the strategy's
+`skimSurplus`).
+
+**Underwater withdraw block.** A strategy is "underwater" / below par when
+`totalBalanceOf(token, staker) < principalOf(token, staker)` (negative yield). While a token's
+strategy is underwater, `withdraw` reverts (`StableStaker: strategy underwater`) so a
+non-migrating user cannot be forced to realise a loss. `emergencyWithdraw` and `migrateOut` are
+**not** blocked — they accept the haircut so the escape hatch and migrations always work.
+`withdrawDisabled(token)` is a cheap public view returning `true` while withdraw is blocked
+(and `false` when no strategy is set).
+
 ## Dependencies
 
 Plain git submodules under `lib/` (no "mutable dependency" mechanism):
@@ -44,6 +86,9 @@ Plain git submodules under `lib/` (no "mutable dependency" mechanism):
 - `lib/forge-std` — external, pinned to tag `v1.16.1`.
 - `lib/flax-token` — phoenix project, tracks `master` HEAD.
 - `lib/pauser` — phoenix project, tracks `master` HEAD.
+- `lib/reflax-yield-vault` — phoenix project, tracks `master` HEAD. Provides
+  `IYieldStrategy` / `AYieldStrategy` / `ERC4626YieldStrategy` (see "Yield strategies" above).
+  Remapped as `reflax-yield-vault/=lib/reflax-yield-vault/src/`.
 
 Remappings live in `foundry.toml` and `remappings.txt`. OZ v5.6.1 requires `solc >= 0.8.24`;
 the project pins `solc = "0.8.28"`.

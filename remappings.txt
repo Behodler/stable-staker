@@ -2,3 +2,4 @@
 forge-std/=lib/forge-std/src/
 flax-token/=lib/flax-token/src/
 pauser/=lib/pauser/src/
+reflax-yield-vault/=lib/reflax-yield-vault/src/
