@@ -101,6 +101,8 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     event EmergencyWithdrawn(address indexed token, address indexed user, uint256 amount);
     event MigratedOut(address indexed token, address indexed user, uint256 amount, uint256 reward);
     event DepositedFor(address indexed token, address indexed user, uint256 amount);
+    event BufferWithdrawn(address indexed token, address indexed user, uint256 amount);
+    event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
 
     // ============================== MODIFIERS ==============================
 
@@ -488,12 +490,40 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         if (address(strategy) == address(0)) {
             return amount;
         }
-        if (guardUnderwater) {
-            require(!_isUnderwater(token, strategy), "StableStaker: strategy underwater");
-        }
         IERC20 t = IERC20(token);
+        if (guardUnderwater && _isUnderwater(token, strategy)) {
+            // Underwater: try to satisfy the entire withdraw from the on-contract buffer.
+            // Caller forwards the returned amount via safeTransfer, so we just signal
+            // "use the buffer" by returning `amount` without touching the strategy.
+            if (t.balanceOf(address(this)) >= amount) {
+                emit BufferWithdrawn(token, msg.sender, amount);
+                return amount;
+            }
+            revert("StableStaker: strategy underwater");
+        }
         uint256 balanceBefore = t.balanceOf(address(this));
         strategy.withdraw(token, amount, address(this));
         return t.balanceOf(address(this)) - balanceBefore;
+    }
+
+    // ============================== OWNER RESCUE ==============================
+
+    /**
+     * @notice Owner-only rescue of arbitrary ERC20s that have accumulated in the contract
+     *         (wrong-token transfers, dust, faucet mistakes, idle buffer). Guarded so the owner
+     *         cannot withdraw user principal: when a token has no strategy set, user principal
+     *         is held idle in this contract and is reserved (= `poolInfo[token].totalStaked`);
+     *         when a strategy is set, principal lives inside the strategy and the contract
+     *         balance is purely buffer + dust, so the full balance is rescuable.
+     * @dev Works while paused — owner rescue is most useful exactly when normal flow is halted.
+     *      No `nonReentrant`: there is no state to corrupt after the trailing `safeTransfer`.
+     */
+    function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "StableStaker: zero recipient");
+        uint256 reserved = address(yieldStrategy[token]) == address(0) ? poolInfo[token].totalStaked : 0;
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        require(bal >= reserved + amount, "StableStaker: would touch user principal");
+        IERC20(token).safeTransfer(to, amount);
+        emit ERC20Rescued(token, to, amount);
     }
 }
