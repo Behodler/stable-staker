@@ -4,7 +4,9 @@ pragma solidity ^0.8.20;
 import "forge-std/Test.sol";
 import "../src/StableStaker.sol";
 import "flax-token/FlaxToken.sol";
+import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 
 /// @notice Core unit tests for StableStaker: staking math, enumerable set, pausing, escape hatch.
 contract StableStakerTest is Test {
@@ -241,5 +243,118 @@ contract StableStakerTest is Test {
         staker.emergencyWithdraw(address(usdc)); // must not revert
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 0);
+    }
+
+    // ---------------------------------------------------------------- rescueERC20 (story 002)
+
+    event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
+
+    function test_rescueERC20_onlyOwner() public {
+        // Mint some token directly into the staker to make the call meaningful.
+        MockERC20 stray = new MockERC20("Stray", "STR", 18);
+        stray.mint(address(staker), 1 ether);
+
+        vm.prank(alice);
+        // OZ Ownable v5 emits OwnableUnauthorizedAccount(address) — just assert it reverts.
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", alice));
+        staker.rescueERC20(address(stray), alice, 1 ether);
+    }
+
+    function test_rescueERC20_unregisteredToken_rescuesFullBalance() public {
+        MockERC20 stray = new MockERC20("Stray", "STR", 18);
+        stray.mint(address(staker), 5 ether);
+
+        vm.expectEmit(true, true, true, true);
+        emit ERC20Rescued(address(stray), owner, 5 ether);
+        staker.rescueERC20(address(stray), owner, 5 ether);
+
+        assertEq(stray.balanceOf(owner), 5 ether);
+        assertEq(stray.balanceOf(address(staker)), 0);
+    }
+
+    function test_rescueERC20_registeredNoStrategy_exactPrincipal_revertsOnAnyAmount() public {
+        // Token registered, no strategy. Staker holds exactly totalStaked.
+        _stake(alice, address(usdc), 100e6);
+        assertEq(usdc.balanceOf(address(staker)), 100e6);
+
+        vm.expectRevert(bytes("StableStaker: would touch user principal"));
+        staker.rescueERC20(address(usdc), owner, 1);
+    }
+
+    function test_rescueERC20_registeredNoStrategy_dust_rescuesExactlyDust() public {
+        _stake(alice, address(usdc), 100e6);
+        // Add dust on top of staked principal (e.g. donation).
+        usdc.mint(address(staker), 7);
+        assertEq(usdc.balanceOf(address(staker)), 100e6 + 7);
+
+        // Can rescue exactly the dust.
+        staker.rescueERC20(address(usdc), owner, 7);
+        assertEq(usdc.balanceOf(address(staker)), 100e6);
+        assertEq(usdc.balanceOf(owner), 7);
+
+        // One wei more would touch principal.
+        usdc.mint(address(staker), 3); // re-add 3 dust
+        vm.expectRevert(bytes("StableStaker: would touch user principal"));
+        staker.rescueERC20(address(usdc), owner, 4);
+    }
+
+    function test_rescueERC20_registeredWithStrategy_rescuesFullBuffer() public {
+        // Wire up a strategy.
+        MockYieldStrategy strategy = new MockYieldStrategy();
+        strategy.setClient(address(staker), true);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy)));
+
+        // Stake while a strategy is set: principal lives in strategy.
+        _stake(alice, address(usdc), 100e6);
+        assertEq(usdc.balanceOf(address(staker)), 0);
+
+        // Faucet (or random donor) seeds buffer of 80e6.
+        usdc.mint(address(staker), 80e6);
+
+        // Owner rescues the full buffer — allowed because principal sits in the strategy.
+        staker.rescueERC20(address(usdc), owner, 80e6);
+        assertEq(usdc.balanceOf(address(staker)), 0);
+        assertEq(usdc.balanceOf(owner), 80e6);
+    }
+
+    function test_rescueERC20_zeroRecipient_reverts() public {
+        MockERC20 stray = new MockERC20("Stray", "STR", 18);
+        stray.mint(address(staker), 1 ether);
+
+        vm.expectRevert(bytes("StableStaker: zero recipient"));
+        staker.rescueERC20(address(stray), address(0), 1 ether);
+    }
+
+    function test_rescueERC20_drainBufferThenWithdrawReverts_underwater() public {
+        // Strategy + underwater + buffer present, then owner drains buffer.
+        MockYieldStrategy strategy = new MockYieldStrategy();
+        strategy.setClient(address(staker), true);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy)));
+
+        _stake(alice, address(usdc), 100e6);
+        strategy.setValueFactorBps(9_000); // underwater
+        usdc.mint(address(staker), 50e6); // seed buffer
+
+        // Buffer would normally allow alice to withdraw 40e6.
+        // But the owner rescues it first.
+        staker.rescueERC20(address(usdc), owner, 50e6);
+        assertEq(usdc.balanceOf(address(staker)), 0);
+
+        // Subsequent user withdraw now reverts — no buffer, strategy still underwater.
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: strategy underwater"));
+        staker.withdraw(address(usdc), 40e6);
+    }
+
+    function test_rescueERC20_worksWhilePaused() public {
+        MockERC20 stray = new MockERC20("Stray", "STR", 18);
+        stray.mint(address(staker), 3 ether);
+
+        vm.prank(pauser);
+        staker.pause();
+
+        // Must not revert: owner rescue is intentionally not gated by whenNotPaused.
+        staker.rescueERC20(address(stray), owner, 3 ether);
+        assertEq(stray.balanceOf(owner), 3 ether);
     }
 }

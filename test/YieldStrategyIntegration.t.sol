@@ -19,10 +19,12 @@ contract YieldStrategyIntegrationTest is Test {
     address internal migrator = address(0x119C);
     address internal alice = address(0xA11CE);
     address internal bob = address(0xB0B);
+    address internal faucet = address(0xFA0CE7);
 
     uint256 internal constant PER_DAY = 86_400 ether; // -> 1e18 phUSD per second
 
     event YieldStrategySet(address indexed token, address indexed oldStrategy, address indexed newStrategy);
+    event BufferWithdrawn(address indexed token, address indexed user, uint256 amount);
 
     function setUp() public {
         phUSD = new FlaxToken();
@@ -200,7 +202,8 @@ contract YieldStrategyIntegrationTest is Test {
         _setStrategy();
         _stake(alice, 100e6);
 
-        // Push below par.
+        // Push below par. Note: NO buffer is funded on the staker here; with story 002 in place,
+        // the underwater revert still fires when the contract holds insufficient idle balance.
         strategy.setValueFactorBps(9_000);
         assertTrue(staker.withdrawDisabled(address(usdc)));
 
@@ -215,6 +218,191 @@ contract YieldStrategyIntegrationTest is Test {
         staker.withdraw(address(usdc), 50e6);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 50e6);
+    }
+
+    // ---------------------------------------------------------------- buffer path (story 002)
+
+    /// @dev Faucet seeds the staker's idle balance — exact behaviour of the off-chain faucet contract.
+    function _seedBuffer(uint256 amount) internal {
+        usdc.mint(faucet, amount);
+        vm.prank(faucet);
+        usdc.transfer(address(staker), amount);
+    }
+
+    function test_withdraw_underwater_bufferCovers_succeedsAndEmits_andStrategyUntouched() public {
+        _setStrategy();
+        _stake(alice, 100e6);
+        strategy.setValueFactorBps(9_000);
+        assertTrue(staker.withdrawDisabled(address(usdc)));
+
+        // Buffer >= amount → withdraw served from buffer, strategy NOT touched.
+        _seedBuffer(60e6);
+        uint256 strategyPrincipalBefore = strategy.principalOf(address(usdc), address(staker));
+        uint256 strategyBalBefore = usdc.balanceOf(address(strategy));
+        uint256 aliceBalBefore = usdc.balanceOf(alice);
+
+        vm.expectEmit(true, true, true, true);
+        emit BufferWithdrawn(address(usdc), alice, 50e6);
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 50e6);
+
+        // Alice paid out of the buffer.
+        assertEq(usdc.balanceOf(alice), aliceBalBefore + 50e6);
+        // Buffer drained by exactly amount.
+        assertEq(usdc.balanceOf(address(staker)), 60e6 - 50e6);
+        // Strategy state untouched: no withdraw call hit it.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), strategyPrincipalBefore);
+        assertEq(usdc.balanceOf(address(strategy)), strategyBalBefore);
+        // Internal accounting still decremented.
+        (uint256 amount,) = staker.userInfo(address(usdc), alice);
+        assertEq(amount, 50e6);
+    }
+
+    function test_withdraw_underwater_bufferShort_revertsAndBufferUnchanged() public {
+        _setStrategy();
+        _stake(alice, 100e6);
+        strategy.setValueFactorBps(9_000);
+
+        _seedBuffer(40e6); // less than requested 50e6
+        uint256 bufferBefore = usdc.balanceOf(address(staker));
+
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: strategy underwater"));
+        staker.withdraw(address(usdc), 50e6);
+
+        // Partial buffer NOT drained.
+        assertEq(usdc.balanceOf(address(staker)), bufferBefore);
+        // Position unchanged.
+        (uint256 amount,) = staker.userInfo(address(usdc), alice);
+        assertEq(amount, 100e6);
+    }
+
+    function test_withdraw_underwater_bufferEqualsAmount_succeedsAtBoundary() public {
+        _setStrategy();
+        _stake(alice, 100e6);
+        strategy.setValueFactorBps(9_000);
+
+        _seedBuffer(50e6); // exactly the withdraw amount
+
+        uint256 aliceBalBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 50e6);
+
+        assertEq(usdc.balanceOf(alice), aliceBalBefore + 50e6);
+        assertEq(usdc.balanceOf(address(staker)), 0);
+    }
+
+    function test_withdraw_underwater_sequentialDrainsBufferThenReverts() public {
+        _setStrategy();
+        _stake(alice, 200e6);
+        strategy.setValueFactorBps(9_000);
+
+        _seedBuffer(70e6);
+
+        // First 30e6: succeeds from buffer.
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 30e6);
+        assertEq(usdc.balanceOf(address(staker)), 40e6);
+
+        // Second 30e6: succeeds from buffer.
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 30e6);
+        assertEq(usdc.balanceOf(address(staker)), 10e6);
+
+        // Third 30e6: exceeds remaining buffer of 10e6, reverts. Buffer not drained.
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: strategy underwater"));
+        staker.withdraw(address(usdc), 30e6);
+        assertEq(usdc.balanceOf(address(staker)), 10e6);
+
+        // Internal accounting reflects the two successful withdrawals only.
+        (uint256 amount,) = staker.userInfo(address(usdc), alice);
+        assertEq(amount, 200e6 - 60e6);
+    }
+
+    function test_withdraw_healthy_withBufferPresent_routesThroughStrategy_bufferPreserved() public {
+        _setStrategy();
+        _stake(alice, 100e6);
+        // Healthy strategy.
+        _seedBuffer(70e6);
+
+        uint256 strategyPrincipalBefore = strategy.principalOf(address(usdc), address(staker));
+        uint256 aliceBalBefore = usdc.balanceOf(alice);
+
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 40e6);
+
+        // Alice paid in full.
+        assertEq(usdc.balanceOf(alice), aliceBalBefore + 40e6);
+        // Strategy principal reduced (withdraw routed through strategy).
+        assertEq(strategy.principalOf(address(usdc), address(staker)), strategyPrincipalBefore - 40e6);
+        // Buffer preserved — strategy paid through to alice without consuming buffer.
+        assertEq(usdc.balanceOf(address(staker)), 70e6);
+    }
+
+    function test_buffer_isPerToken_tokenABufferDoesNotEnableTokenBWithdraw() public {
+        // Add a second token with its own strategy.
+        MockERC20 dai = new MockERC20("Dai", "DAI", 18);
+        staker.addToken(address(dai));
+        MockYieldStrategy strategyDai = new MockYieldStrategy();
+        strategyDai.setClient(address(staker), true);
+
+        _setStrategy(); // USDC strategy
+        staker.setYieldStrategy(address(dai), IYieldStrategy(address(strategyDai)));
+
+        // Fund alice for both tokens & stake.
+        dai.mint(alice, 1_000 ether);
+        vm.prank(alice);
+        dai.approve(address(staker), type(uint256).max);
+
+        _stake(alice, 100e6); // USDC
+        vm.prank(alice);
+        staker.stake(address(dai), 100 ether);
+
+        // Both underwater.
+        strategy.setValueFactorBps(9_000);
+        strategyDai.setValueFactorBps(9_000);
+
+        // Buffer USDC only.
+        _seedBuffer(100e6);
+
+        // USDC withdraw succeeds (its own buffer).
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 50e6);
+
+        // DAI withdraw still reverts — its buffer is empty.
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: strategy underwater"));
+        staker.withdraw(address(dai), 50 ether);
+    }
+
+    function test_stake_whileUnderwater_stillWorks_regression() public {
+        _setStrategy();
+        _stake(alice, 100e6);
+        // Push underwater.
+        strategy.setValueFactorBps(9_000);
+
+        // Staking through the dip MUST still work (DCA argument).
+        _stake(bob, 50e6);
+
+        (uint256 bobAmt,) = staker.userInfo(address(usdc), bob);
+        assertEq(bobAmt, 50e6);
+    }
+
+    function test_deposit_doesNotConsumeBuffer() public {
+        _setStrategy();
+        _stake(alice, 100e6); // routes into strategy
+        // Pre-fund buffer.
+        _seedBuffer(75e6);
+        assertEq(usdc.balanceOf(address(staker)), 75e6);
+
+        // Bob stakes 30e6: should flow through to strategy, leaving buffer intact.
+        _stake(bob, 30e6);
+
+        // Buffer preserved.
+        assertEq(usdc.balanceOf(address(staker)), 75e6);
+        // Bob's 30e6 lives in the strategy.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 130e6);
     }
 
     // ---------------------------------------------------------------- emergencyWithdraw (no guard)
