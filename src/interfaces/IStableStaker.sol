@@ -9,19 +9,28 @@ pragma solidity ^0.8.20;
  */
 interface IStableStaker {
     /**
-     * @notice Permissioned, batched exit. For each user: settles and mints their pending
-     *         phUSD, zeroes their position and removes them from the staker set. The sum of
-     *         all withdrawn principal is transferred to the caller (the migrator).
+     * @notice Engage terminal migration for `token`: realize the entire strategy position once and
+     *         snapshot (R, P) so all subsequent exits pay a fixed, order-independent pro-rata credit.
+     *         Must be called exactly once before any {batchMigrate}. Terminal — there is no resume path.
+     * @dev Permissioned (`onlyMigrator` on the staker). Reverts if `token` is already migrating.
+     * @param token The staked token to put into terminal migration.
+     */
+    function initiateMigration(address token) external;
+
+    /**
+     * @notice Permissioned, batched terminal-migration exit (replaces the legacy `migrateOut`).
+     *         For each user: mints their frozen pending phUSD, zeroes their position and removes them
+     *         from the staker set. The aggregate snapshot credit is transferred to the caller (the
+     *         migrator). Requires a prior {initiateMigration}.
      * @param token  The staked token whose positions are being migrated out.
      * @param users  The users to migrate.
-     * @return amounts Per-user amount actually re-credited, parallel to `users` (0 for empty positions).
-     *         At or above par these equal each user's requested principal. Below par the strategy
-     *         delivers a haircut, so each non-zero entry is scaled to its REALIZED, pro-rata share of
-     *         the redeemed payout (`requested * payout / totalRequested`, floored), guaranteeing the
-     *         sum never exceeds the funds transferred to the migrator. Floor-division dust accrues to
-     *         the protocol (left in the migrator).
+     * @return amounts Per-user snapshot-consistent realized credit `p_i·min(R,P)/P`, parallel to `users`
+     *         (0 for empty / already self-migrated positions). At or above par these equal each user's
+     *         principal; below par every user takes the SAME uniform haircut, independent of batch
+     *         composition or ordering. Σ amounts ≤ R, so the migrator's redeposits can never exceed the
+     *         funds it received. Floor-division dust accrues to the protocol (left in the old staker).
      */
-    function migrateOut(address token, address[] calldata users) external returns (uint256[] memory amounts);
+    function batchMigrate(address token, address[] calldata users) external returns (uint256[] memory amounts);
 
     /**
      * @notice Permissioned deposit crediting `user`. Pulls `amount` of `token` from the caller

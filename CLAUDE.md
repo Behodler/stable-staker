@@ -14,8 +14,9 @@ directly to users on claim / withdraw / migration.
   `stakerCount`), Behodler3 pausing (`pauser` + `IPausable`), and a permissionless
   `emergencyWithdraw` escape hatch.
 - `src/StableStakerMigrator.sol` — moves a batch of users from one `StableStaker` to another with
-  zero user action, preserving principal and minting earned rewards. Uses the staker's
-  permissioned `migrateOut` / `depositFor` hooks (caller must be the configured `migrator`).
+  zero user action, preserving principal and minting earned rewards. Uses the staker's permissioned
+  terminal-migration hooks `initiateMigration` (once per token) + `batchMigrate` / `depositFor`
+  (caller must be the configured `migrator`). See "Terminal migration mode" below.
 - `src/interfaces/IStableStaker.sol` — minimal interface the migrator depends on.
 
 ## Core safety invariant
@@ -42,8 +43,10 @@ By default a staked token sits **idle** in the contract. A token can optionally 
 through a per-token `IYieldStrategy` adapter (from the `reflax-yield-vault` submodule) so the
 staked stables earn yield instead of sitting idle. This is opt-in per token via
 `setYieldStrategy(token, strategy)` (`onlyOwner`, `poolExists`); `address(0)` ⇒ idle-hold (the
-original behaviour). All five principal-moving paths (`stake`, `withdraw`, `emergencyWithdraw`,
-`migrateOut`, `depositFor`) route through the strategy when one is set.
+original behaviour). The principal-moving paths (`stake`, `withdraw`, `emergencyWithdraw`,
+`initiateMigration`, `depositFor`) route through the strategy when one is set. `initiateMigration`
+realizes the whole position once (via the client-callable `strategy.withdraw`) and then decouples
+the strategy; `batchMigrate` / `userMigrate` thereafter pay from the realized idle pile only.
 
 **Wiring a strategy (two sides, both required):**
 
@@ -73,10 +76,24 @@ accumulates inside the strategy as protocol-owned surplus (skimmed elsewhere via
 **Underwater withdraw block.** A strategy is "underwater" / below par when
 `totalBalanceOf(token, staker) < principalOf(token, staker)` (negative yield). While a token's
 strategy is underwater, `withdraw` reverts (`StableStaker: strategy underwater`) so a
-non-migrating user cannot be forced to realise a loss. `emergencyWithdraw` and `migrateOut` are
-**not** blocked — they accept the haircut so the escape hatch and migrations always work.
-`withdrawDisabled(token)` is a cheap public view returning `true` while withdraw is blocked
-(and `false` when no strategy is set).
+non-migrating user cannot be forced to realise a loss. `emergencyWithdraw` and `initiateMigration`
+are **not** blocked by the underwater guard — they accept the haircut so the escape hatch and
+migrations always work. `withdrawDisabled(token)` is a cheap public view returning `true` while
+withdraw is blocked (and `false` when no strategy is set).
+
+## Terminal migration mode
+
+`initiateMigration(token)` (`onlyMigrator`) engages a **terminal, per-token** migration: it settles
+& freezes emissions, snapshots `P = totalStaked`, realizes the whole strategy position once into
+idle balance as `R` (via the client-callable `strategy.withdraw`, NOT `totalWithdrawal` — see the
+source comment for why), decouples the strategy, and sets `active = true`. Thereafter every exit —
+operator `batchMigrate` or permissionless `userMigrate` — pays a fixed credit `p_i·min(R,P)/P` from
+the idle pile, so payouts are independent of batch composition, ordering, and batch-vs-self.
+Equal principal ⇒ equal payout (closes ss2m1 / M-01). Migration is terminal: once engaged a token's
+pool can never resume healthy operation (no resume path), and `stake` / `withdraw` /
+`emergencyWithdraw` / the old staker's `depositFor` are blocked while `active` to preserve the
+snapshot. The `StableStakerMigrator` exposes an owner-only `initiateMigration` forwarder (call once
+per token before the first `migrate` batch).
 
 ## Dependencies
 

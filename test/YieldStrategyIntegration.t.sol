@@ -426,9 +426,9 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(staker.stakerCount(address(usdc)), 0);
     }
 
-    // ---------------------------------------------------------------- migrateOut (no guard, aggregate)
+    // ----------------------------------------------- terminal migration (initiate + batchMigrate)
 
-    function test_migrateOut_underwater_deliversRedeemedAggregate() public {
+    function test_batchMigrate_underwater_deliversSnapshotCredits() public {
         _setStrategy();
         _stake(alice, 100e6);
         _stake(bob, 300e6);
@@ -440,20 +440,25 @@ contract YieldStrategyIntegrationTest is Test {
         users[0] = alice;
         users[1] = bob;
 
+        // Engage terminal migration: realizes the whole position once (400e6 * 0.9 = 360e6 = R),
+        // then decouples the strategy (principalOf drained to 0).
+        vm.prank(migrator);
+        staker.initiateMigration(address(usdc));
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
+
         uint256 migBefore = usdc.balanceOf(migrator);
         vm.prank(migrator);
-        staker.migrateOut(address(usdc), users);
+        staker.batchMigrate(address(usdc), users);
 
-        // Aggregate principal 400e6 redeemed at 90% = 360e6 delivered to migrator.
+        // Snapshot credits: 90e6 + 270e6 = 360e6 transferred to the migrator from the idle pile.
         assertEq(usdc.balanceOf(migrator) - migBefore, 360e6);
         (uint256 aliceAmt,) = staker.userInfo(address(usdc), alice);
         (uint256 bobAmt,) = staker.userInfo(address(usdc), bob);
         assertEq(aliceAmt, 0);
         assertEq(bobAmt, 0);
-        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
     }
 
-    function test_migrateOut_atPar_deliversFullAggregate() public {
+    function test_batchMigrate_atPar_deliversFullPrincipal() public {
         _setStrategy();
         _stake(alice, 100e6);
         _stake(bob, 300e6);
@@ -462,12 +467,15 @@ contract YieldStrategyIntegrationTest is Test {
         users[0] = alice;
         users[1] = bob;
 
+        vm.prank(migrator);
+        staker.initiateMigration(address(usdc));
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
+
         uint256 migBefore = usdc.balanceOf(migrator);
         vm.prank(migrator);
-        staker.migrateOut(address(usdc), users);
+        staker.batchMigrate(address(usdc), users);
 
         assertEq(usdc.balanceOf(migrator) - migBefore, 400e6);
-        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
     }
 
     // ---------------------------------------------------------------- yield never reaches staker

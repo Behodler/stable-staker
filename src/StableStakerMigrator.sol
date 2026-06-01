@@ -16,8 +16,11 @@ import "./interfaces/IStableStaker.sol";
  *
  *      The migrator must be set as `migrator` on BOTH stakers (via `setMigrator`), and the new
  *      staker must already have the token registered (`addToken`). It uses the per-user `amounts`
- *      returned by {IStableStaker-migrateOut}, which guarantees the approval/redeposit totals
+ *      returned by {IStableStaker-batchMigrate}, which guarantees the approval/redeposit totals
  *      exactly match the principal that was pulled in.
+ *
+ *      Terminal-migration flow: the owner calls {initiateMigration} ONCE per token (engaging the
+ *      old staker's terminal snapshot), then {migrate} for each batch of users.
  */
 contract StableStakerMigrator is Ownable {
     using SafeERC20 for IERC20;
@@ -38,12 +41,25 @@ contract StableStakerMigrator is Ownable {
     }
 
     /**
+     * @notice Engage terminal migration on the old staker for `token`. Thin owner-only forwarder to
+     *         {IStableStaker-initiateMigration}: realizes the strategy position once and snapshots
+     *         (R, P) so every subsequent {migrate} batch pays a fixed, order-independent credit.
+     * @dev Must be called exactly once per token BEFORE the first {migrate} batch. Reverts (on the
+     *      staker) if the token is already migrating, so it is naturally idempotent-guarded.
+     * @param token The staked token to put into terminal migration on the old staker.
+     */
+    function initiateMigration(address token) external onlyOwner {
+        oldStaker.initiateMigration(token);
+    }
+
+    /**
      * @notice Migrate a batch of users for `token` from the old staker to the new staker.
+     * @dev Requires a prior {initiateMigration} for `token` (the old staker reverts otherwise).
      * @param token The staked token to migrate.
      * @param users The users to migrate (build batches off-chain via getStakers/getStakersRange).
      */
     function migrate(address token, address[] calldata users) external onlyOwner {
-        uint256[] memory amounts = oldStaker.migrateOut(token, users);
+        uint256[] memory amounts = oldStaker.batchMigrate(token, users);
 
         uint256 total;
         for (uint256 i = 0; i < amounts.length; i++) {

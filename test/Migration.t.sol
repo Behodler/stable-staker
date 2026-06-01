@@ -10,8 +10,9 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 
-/// @notice End-to-end migration: an operator moves users from v1 to v2 with zero user action,
-///         principal and earned rewards preserved, and v2 keeps accruing afterwards.
+/// @notice Terminal migration mode: an operator engages a one-time (R, P) snapshot on the old staker
+///         and moves users to the new staker. Payouts are a fixed pro-rata of the snapshot, so they are
+///         identical across batch composition, ordering, and batch-vs-self exit.
 contract MigrationTest is Test {
     FlaxToken internal phUSD;
     StableStaker internal oldStaker;
@@ -57,6 +58,23 @@ contract MigrationTest is Test {
         vm.stopPrank();
     }
 
+    function _users() internal view returns (address[] memory users) {
+        users = new address[](2);
+        users[0] = alice;
+        users[1] = bob;
+    }
+
+    /// @dev Route the OLD staker's USDC principal through a MockYieldStrategy so we can force it
+    ///      below / above par via setValueFactorBps. setYieldStrategy sweeps the already-staked idle
+    ///      balance into the strategy. Returns the strategy so the test can set the value factor.
+    function _routeOldThroughStrategy() internal returns (MockYieldStrategy strategy) {
+        strategy = new MockYieldStrategy();
+        strategy.setClient(address(oldStaker), true);
+        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy)));
+    }
+
+    // ============================== END-TO-END (NO STRATEGY) ==============================
+
     function test_endToEnd_migration_preservesPositionsAndRewards() public {
         // accrue rewards in v1 for a day
         vm.warp(block.timestamp + 1 days);
@@ -66,12 +84,8 @@ contract MigrationTest is Test {
         assertGt(pendingAlice, 0);
         assertGt(pendingBob, 0);
 
-        address[] memory users = new address[](2);
-        users[0] = alice;
-        users[1] = bob;
-
-        // single operator transaction; neither alice nor bob acts.
-        migrator.migrate(address(usdc), users);
+        migrator.initiateMigration(address(usdc));
+        migrator.migrate(address(usdc), _users());
 
         // --- v1 fully drained ---
         (uint256 aOld,) = oldStaker.userInfo(address(usdc), alice);
@@ -83,7 +97,7 @@ contract MigrationTest is Test {
         assertEq(oldStaker.stakerCount(address(usdc)), 0);
         assertEq(usdc.balanceOf(address(oldStaker)), 0);
 
-        // --- earned rewards minted to the users during migrateOut (same block => exact) ---
+        // --- earned rewards minted to the users during batchMigrate (same block => exact) ---
         assertEq(phUSD.balanceOf(alice), pendingAlice);
         assertEq(phUSD.balanceOf(bob), pendingBob);
 
@@ -109,7 +123,10 @@ contract MigrationTest is Test {
         assertGt(phUSD.balanceOf(alice), aliceBefore);
     }
 
+    // ============================== PERMISSION GUARDS ==============================
+
     function test_migrate_onlyOwner() public {
+        migrator.initiateMigration(address(usdc));
         address[] memory users = new address[](1);
         users[0] = alice;
         vm.prank(alice);
@@ -117,12 +134,25 @@ contract MigrationTest is Test {
         migrator.migrate(address(usdc), users);
     }
 
-    function test_migrateOut_onlyMigrator() public {
+    function test_initiateMigration_onlyOwner_onMigrator() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        migrator.initiateMigration(address(usdc));
+    }
+
+    function test_batchMigrate_onlyMigrator() public {
+        migrator.initiateMigration(address(usdc));
         address[] memory users = new address[](1);
         users[0] = alice;
         vm.prank(alice);
         vm.expectRevert(bytes("StableStaker: only migrator"));
-        oldStaker.migrateOut(address(usdc), users);
+        oldStaker.batchMigrate(address(usdc), users);
+    }
+
+    function test_initiateMigration_onlyMigrator_onStaker() public {
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: only migrator"));
+        oldStaker.initiateMigration(address(usdc));
     }
 
     function test_depositFor_onlyMigrator() public {
@@ -137,69 +167,200 @@ contract MigrationTest is Test {
         oldStaker.pause();
         vm.warp(block.timestamp + 1 days);
 
-        address[] memory users = new address[](2);
-        users[0] = alice;
-        users[1] = bob;
-        migrator.migrate(address(usdc), users);
+        migrator.initiateMigration(address(usdc));
+        migrator.migrate(address(usdc), _users());
 
         (uint256 aNew,) = newStaker.userInfo(address(usdc), alice);
         assertEq(aNew, 100e6);
     }
 
-    // ============================== M-01: UNDERWATER MIGRATION ==============================
+    // ============================== CORE: ORDER / METHOD INDEPENDENCE ==============================
 
-    /// @dev Route the OLD staker's USDC principal through a MockYieldStrategy so we can force it
-    ///      below par via setValueFactorBps. Sweeps the already-staked idle balance into the
-    ///      strategy. Returns the strategy so the test can set the value factor.
-    function _routeOldThroughStrategy() internal returns (MockYieldStrategy strategy) {
-        strategy = new MockYieldStrategy();
-        strategy.setClient(address(oldStaker), true);
-        // setYieldStrategy sweeps the existing idle USDC into the strategy.
-        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy)));
+    // The ss2m1 fix: two users with EQUAL principal under an underwater AMM strategy must receive
+    // IDENTICAL payouts across every exit permutation. We give alice & bob equal principal in a
+    // fresh deployment and compare the four permutations.
+    function test_orderMethodIndependence_equalPrincipal_underwater() public {
+        // Helper that builds a fresh equal-principal underwater system, runs `mode`, and returns
+        // (alicePayout, bobPayout). mode: 0=oneBatch, 1=separateBatches, 2=aliceSelfThenBob,
+        // 3=reversedOrderBatch.
+        uint256 P_EACH = 200e6;
+        uint16 FACTOR = 9_000; // 10% underwater
+
+        (uint256 a0, uint256 b0) = _runPermutation(P_EACH, FACTOR, 0);
+        (uint256 a1, uint256 b1) = _runPermutation(P_EACH, FACTOR, 1);
+        (uint256 a2, uint256 b2) = _runPermutation(P_EACH, FACTOR, 2);
+        (uint256 a3, uint256 b3) = _runPermutation(P_EACH, FACTOR, 3);
+
+        // Equal principal => equal payout, in EVERY permutation.
+        assertEq(a0, b0, "perm0 a!=b");
+        assertEq(a1, b1, "perm1 a!=b");
+        assertEq(a2, b2, "perm2 a!=b");
+        assertEq(a3, b3, "perm3 a!=b");
+
+        // And the payout is identical ACROSS permutations (method/order independence).
+        assertEq(a0, a1);
+        assertEq(a0, a2);
+        assertEq(a0, a3);
+        assertEq(b0, b1);
+        assertEq(b0, b2);
+        assertEq(b0, b3);
+
+        // Sanity: the haircut actually applied (under par), so this is a non-trivial equality.
+        assertEq(a0, (P_EACH * FACTOR) / 10_000); // 180e6
     }
 
-    function _users() internal view returns (address[] memory users) {
-        users = new address[](2);
-        users[0] = alice;
-        users[1] = bob;
+    /// @dev Build a fresh old/new staker pair with alice & bob each staking `pEach`, route through an
+    ///      underwater strategy (`factorBps`), engage migration, then exit via `mode`. Returns each
+    ///      user's realized payout (new-staker credit for batch, wallet delta for self-migrate).
+    function _runPermutation(uint256 pEach, uint16 factorBps, uint8 mode)
+        internal
+        returns (uint256 alicePayout, uint256 bobPayout)
+    {
+        // Fresh isolated deployment so permutations don't interfere.
+        StableStaker oStaker = new StableStaker(phUSD, owner);
+        StableStaker nStaker = new StableStaker(phUSD, owner);
+        phUSD.setMinter(address(oStaker), true);
+        phUSD.setMinter(address(nStaker), true);
+        oStaker.addToken(address(usdc));
+        nStaker.addToken(address(usdc));
+        oStaker.phUSDPerDay(address(usdc), PER_DAY);
+        nStaker.phUSDPerDay(address(usdc), PER_DAY);
+        StableStakerMigrator m =
+            new StableStakerMigrator(IStableStaker(address(oStaker)), IStableStaker(address(nStaker)), owner);
+        oStaker.setMigrator(address(m));
+        nStaker.setMigrator(address(m));
+
+        // equal-principal stakes
+        usdc.mint(alice, pEach);
+        usdc.mint(bob, pEach);
+        vm.startPrank(alice);
+        usdc.approve(address(oStaker), type(uint256).max);
+        oStaker.stake(address(usdc), pEach);
+        vm.stopPrank();
+        vm.startPrank(bob);
+        usdc.approve(address(oStaker), type(uint256).max);
+        oStaker.stake(address(usdc), pEach);
+        vm.stopPrank();
+
+        // underwater strategy
+        MockYieldStrategy strat = new MockYieldStrategy();
+        strat.setClient(address(oStaker), true);
+        oStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strat)));
+        strat.setValueFactorBps(factorBps);
+
+        m.initiateMigration(address(usdc));
+
+        if (mode == 0) {
+            // both in one batch [alice, bob]
+            address[] memory u = new address[](2);
+            u[0] = alice;
+            u[1] = bob;
+            m.migrate(address(usdc), u);
+            alicePayout = _newCredit(nStaker, alice);
+            bobPayout = _newCredit(nStaker, bob);
+        } else if (mode == 1) {
+            // separate batches: [alice] then [bob]
+            address[] memory ua = new address[](1);
+            ua[0] = alice;
+            m.migrate(address(usdc), ua);
+            address[] memory ub = new address[](1);
+            ub[0] = bob;
+            m.migrate(address(usdc), ub);
+            alicePayout = _newCredit(nStaker, alice);
+            bobPayout = _newCredit(nStaker, bob);
+        } else if (mode == 2) {
+            // alice self-migrates (wallet), then bob via batch
+            uint256 aBefore = usdc.balanceOf(alice);
+            vm.prank(alice);
+            oStaker.userMigrate(address(usdc));
+            alicePayout = usdc.balanceOf(alice) - aBefore;
+            address[] memory ub = new address[](1);
+            ub[0] = bob;
+            m.migrate(address(usdc), ub);
+            bobPayout = _newCredit(nStaker, bob);
+        } else {
+            // reversed-order batch [bob, alice]
+            address[] memory u = new address[](2);
+            u[0] = bob;
+            u[1] = alice;
+            m.migrate(address(usdc), u);
+            alicePayout = _newCredit(nStaker, alice);
+            bobPayout = _newCredit(nStaker, bob);
+        }
     }
 
-    // M-01: a below-par migration must NOT revert (previously bricked with ERC20InsufficientBalance).
-    function test_underwaterMigration_doesNotBrick() public {
+    function _newCredit(StableStaker s, address who) internal view returns (uint256 amt) {
+        (amt,) = s.userInfo(address(usdc), who);
+    }
+
+    // ============================== HEALTHY = PAR ==============================
+
+    // valueFactorBps >= 10000: every user credited exactly p_i; new staker holds Σ p_i; no user gets
+    // yield; any above-par yield stays in the (now-decoupled) strategy, not credited.
+    function test_healthy_atOrAbovePar_creditsParNoYield() public {
         MockYieldStrategy strategy = _routeOldThroughStrategy();
-        strategy.setValueFactorBps(9_000); // 10% loss
+        strategy.setValueFactorBps(11_000); // 10% above par (yield)
 
-        // Pre-fix this reverts with ERC20InsufficientBalance(migrator, 260e6, 300e6). It must now succeed.
+        migrator.initiateMigration(address(usdc));
         migrator.migrate(address(usdc), _users());
 
-        // Sanity: new staker has positions.
-        assertEq(newStaker.stakerCount(address(usdc)), 2);
-    }
-
-    // M-01: each user is credited their realized, pro-rata share of the haircut payout.
-    function test_underwaterMigration_proRataCreditOnNewStaker() public {
-        MockYieldStrategy strategy = _routeOldThroughStrategy();
-        strategy.setValueFactorBps(9_000); // 10% loss
-
-        migrator.migrate(address(usdc), _users());
-
-        // requested * 9000 / 10000
         (uint256 aNew,) = newStaker.userInfo(address(usdc), alice);
         (uint256 bNew,) = newStaker.userInfo(address(usdc), bob);
-        assertEq(aNew, 90e6); // 100e6 * 9000 / 10000
-        assertEq(bNew, 270e6); // 300e6 * 9000 / 10000
+        assertEq(aNew, 100e6); // exactly principal, no yield
+        assertEq(bNew, 300e6);
 
         (,,, uint256 newTotal) = newStaker.poolInfo(address(usdc));
-        assertEq(newTotal, 360e6); // == payout, exact since both divisions are clean here
+        assertEq(newTotal, 400e6);
+        assertEq(usdc.balanceOf(address(newStaker)), 400e6);
+
+        // Above-par realized R was capped at par by withdraw, so R == P == 400e6: no surplus reached
+        // anyone, and no above-par yield was credited.
+        (, uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertEq(R, 400e6);
+        assertEq(P, 400e6);
+        // no dust stranded in the migrator
+        assertEq(usdc.balanceOf(address(migrator)), 0);
     }
 
-    // M-01: conservation / solvency — Σ credited <= payout received, and the new staker actually
-    // holds at least the credited principal.
-    function test_underwaterMigration_conservationAndSolvency() public {
+    // ============================== UNDERWATER = UNIFORM HAIRCUT ==============================
+
+    // valueFactorBps < 10000: all users (batch and self) credited floor(p_i * R / P); Σ credit <= R;
+    // dust <= N wei.
+    function test_underwater_uniformHaircut_batchAndSelf() public {
         MockYieldStrategy strategy = _routeOldThroughStrategy();
         strategy.setValueFactorBps(9_000); // 10% loss
 
-        uint256 payout = (400e6 * 9_000) / 10_000; // 360e6 delivered to the migrator
+        migrator.initiateMigration(address(usdc));
+        (, uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertEq(R, 360e6); // 400e6 * 0.9
+        assertEq(P, 400e6);
+
+        // alice self-migrates, bob via batch
+        uint256 aBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        oldStaker.userMigrate(address(usdc));
+        uint256 aliceCredit = usdc.balanceOf(alice) - aBefore;
+
+        address[] memory ub = new address[](1);
+        ub[0] = bob;
+        migrator.migrate(address(usdc), ub);
+        (uint256 bobCredit,) = newStaker.userInfo(address(usdc), bob);
+
+        assertEq(aliceCredit, (100e6 * R) / P); // 90e6
+        assertEq(bobCredit, (300e6 * R) / P); // 270e6
+
+        uint256 sumCredit = aliceCredit + bobCredit;
+        assertLe(sumCredit, R);
+        // dust bounded by number of distinct exits (<= 2 here)
+        assertLe(R - sumCredit, 2);
+    }
+
+    function test_underwater_dustBound_uglyFactor() public {
+        MockYieldStrategy strategy = _routeOldThroughStrategy();
+        strategy.setValueFactorBps(8_333); // non-clean divisions
+
+        migrator.initiateMigration(address(usdc));
+        (, uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
 
         migrator.migrate(address(usdc), _users());
 
@@ -207,119 +368,224 @@ contract MigrationTest is Test {
         (uint256 bNew,) = newStaker.userInfo(address(usdc), bob);
         uint256 credited = aNew + bNew;
 
-        // Σ credited never exceeds what the migrator received.
-        assertLe(credited, payout);
-        // New staker holds at least the credited principal (idle hold; no strategy on new staker).
-        assertGe(usdc.balanceOf(address(newStaker)), credited);
+        assertEq(aNew, (100e6 * R) / P);
+        assertEq(bNew, (300e6 * R) / P);
+        assertLe(credited, R);
+        // floor dust strictly bounded by number of credited users
+        assertLt(R - credited, 2);
     }
 
-    // M-01: floor-division dust is bounded by users.length and equals exactly payout - Σ credited.
-    function test_underwaterMigration_dustBound() public {
+    // ============================== CONSERVATION ==============================
+
+    // Σ credit + idle-residual == R exactly; the residual stays in the terminal staker (owner-rescuable).
+    function test_conservation_sumCreditPlusResidualEqualsR() public {
         MockYieldStrategy strategy = _routeOldThroughStrategy();
-        // Use an "ugly" factor so the pro-rata divisions floor and leave residual dust.
-        strategy.setValueFactorBps(8_333); // 16.67% loss; non-clean divisions
+        strategy.setValueFactorBps(8_333);
 
-        uint256 payout = (400e6 * 8_333) / 10_000;
+        migrator.initiateMigration(address(usdc));
+        (, uint256 R,) = oldStaker.migrationInfo(address(usdc));
 
-        address[] memory users = _users();
-        migrator.migrate(address(usdc), users);
+        // realized R now sits idle in the old staker
+        assertEq(usdc.balanceOf(address(oldStaker)), R);
+
+        migrator.migrate(address(usdc), _users());
 
         (uint256 aNew,) = newStaker.userInfo(address(usdc), alice);
         (uint256 bNew,) = newStaker.userInfo(address(usdc), bob);
         uint256 credited = aNew + bNew;
 
-        uint256 residual = usdc.balanceOf(address(migrator));
-        // Residual is exactly the un-credited portion of the payout...
-        assertEq(residual, payout - credited);
-        // ...and is strictly bounded by users.length base units (pro-rata floor dust).
-        assertLt(residual, users.length);
-    }
+        // The credited total was transferred out of the old staker; the residual stays behind.
+        uint256 residual = usdc.balanceOf(address(oldStaker));
+        assertEq(credited + residual, R);
 
-    // M-01: the old staker is fully drained below par (positions zeroed, set emptied, pool zeroed).
-    function test_underwaterMigration_oldStakerFullyDrained() public {
-        MockYieldStrategy strategy = _routeOldThroughStrategy();
-        strategy.setValueFactorBps(9_000);
-
-        migrator.migrate(address(usdc), _users());
-
-        (uint256 aOld,) = oldStaker.userInfo(address(usdc), alice);
-        (uint256 bOld,) = oldStaker.userInfo(address(usdc), bob);
-        assertEq(aOld, 0);
-        assertEq(bOld, 0);
+        // After everyone migrated, totalStaked == 0, so the owner can rescue the residual dust.
         (,,, uint256 oldTotal) = oldStaker.poolInfo(address(usdc));
         assertEq(oldTotal, 0);
-        assertEq(oldStaker.stakerCount(address(usdc)), 0);
+        if (residual > 0) {
+            oldStaker.rescueERC20(address(usdc), owner, residual);
+            assertEq(usdc.balanceOf(address(oldStaker)), 0);
+        }
     }
 
-    // M-01: rewards are still minted during an underwater migrateOut (independent of the haircut).
-    function test_underwaterMigration_rewardsStillMinted() public {
+    // ============================== STATE GUARDS ==============================
+
+    function test_guard_stakeBlockedWhileMigrating() public {
+        migrator.initiateMigration(address(usdc));
+        usdc.mint(alice, 1e6);
+        vm.startPrank(alice);
+        usdc.approve(address(oldStaker), type(uint256).max);
+        vm.expectRevert(bytes("StableStaker: migrating"));
+        oldStaker.stake(address(usdc), 1e6);
+        vm.stopPrank();
+    }
+
+    function test_guard_withdrawBlockedWhileMigrating() public {
+        migrator.initiateMigration(address(usdc));
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: migrating"));
+        oldStaker.withdraw(address(usdc), 1e6);
+    }
+
+    function test_guard_emergencyWithdrawBlockedWhileMigrating() public {
+        migrator.initiateMigration(address(usdc));
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: migrating"));
+        oldStaker.emergencyWithdraw(address(usdc));
+    }
+
+    function test_guard_depositForBlockedOnMigratingStaker() public {
+        migrator.initiateMigration(address(usdc));
+        // depositFor must come from the migrator; it is blocked on the OLD (migrating) staker.
+        vm.prank(address(migrator));
+        vm.expectRevert(bytes("StableStaker: migrating"));
+        oldStaker.depositFor(address(usdc), alice, 1e6);
+    }
+
+    function test_guard_userMigrateRevertsWhenNotMigrating() public {
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: not migrating"));
+        oldStaker.userMigrate(address(usdc));
+    }
+
+    function test_guard_batchMigrateRevertsWithoutInitiate() public {
+        vm.prank(address(migrator));
+        vm.expectRevert(bytes("StableStaker: not migrating"));
+        oldStaker.batchMigrate(address(usdc), _users());
+    }
+
+    function test_guard_initiateMigrationRevertsWhenAlreadyActive() public {
+        migrator.initiateMigration(address(usdc));
+        // terminal: cannot be re-initiated
+        vm.prank(address(migrator));
+        vm.expectRevert(bytes("StableStaker: already migrating"));
+        oldStaker.initiateMigration(address(usdc));
+    }
+
+    // ============================== REWARDS STILL MINTED ==============================
+
+    // Each migrating user's frozen pending phUSD is minted regardless of the principal haircut, and
+    // emissions are frozen at the snapshot (_updatePool no-op while active).
+    function test_rewards_frozenAtSnapshotAndMinted() public {
         MockYieldStrategy strategy = _routeOldThroughStrategy();
         strategy.setValueFactorBps(9_000);
 
-        // accrue a day of rewards before migrating
         vm.warp(block.timestamp + 1 days);
         uint256 pendingAlice = oldStaker.pendingReward(address(usdc), alice);
         uint256 pendingBob = oldStaker.pendingReward(address(usdc), bob);
         assertGt(pendingAlice, 0);
-        assertGt(pendingBob, 0);
+
+        migrator.initiateMigration(address(usdc));
+
+        // Emissions are now frozen: warping forward does NOT grow pending.
+        uint256 frozenAlice = oldStaker.pendingReward(address(usdc), alice);
+        vm.warp(block.timestamp + 5 days);
+        assertEq(oldStaker.pendingReward(address(usdc), alice), frozenAlice);
 
         migrator.migrate(address(usdc), _users());
 
-        // same block as migrateOut => exact
+        // Pending minted in full (frozen value), independent of the 10% principal haircut.
         assertEq(phUSD.balanceOf(alice), pendingAlice);
         assertEq(phUSD.balanceOf(bob), pendingBob);
     }
 
-    // M-01: boundary — at par (10000 bps) the rescale is skipped; full principal credited, no dust.
-    // This re-runs the at-par scenario WITH a strategy wired to prove the guard skips correctly.
-    function test_atParMigration_throughStrategy_stillExact() public {
-        MockYieldStrategy strategy = _routeOldThroughStrategy();
-        strategy.setValueFactorBps(10_000); // par
+    // ============================== NO-STRATEGY POOL ==============================
+
+    // initiateMigration on a pool with no strategy sets R = P (idle principal); credits par.
+    function test_noStrategy_setsRequalP_creditsPar() public {
+        // setUp leaves the old staker with no strategy: principal sits idle.
+        migrator.initiateMigration(address(usdc));
+        (bool active, uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertTrue(active);
+        assertEq(R, 400e6);
+        assertEq(P, 400e6);
 
         migrator.migrate(address(usdc), _users());
-
         (uint256 aNew,) = newStaker.userInfo(address(usdc), alice);
         (uint256 bNew,) = newStaker.userInfo(address(usdc), bob);
         assertEq(aNew, 100e6);
         assertEq(bNew, 300e6);
-        (,,, uint256 newTotal) = newStaker.poolInfo(address(usdc));
-        assertEq(newTotal, 400e6);
-        assertEq(usdc.balanceOf(address(newStaker)), 400e6);
-        // rescale skipped at par => no dust stranded
-        assertEq(usdc.balanceOf(address(migrator)), 0);
+        assertEq(usdc.balanceOf(address(oldStaker)), 0); // fully forwarded
     }
 
-    // M-01 (optional): a dust-sized position whose pro-rata share floors to 0 is skipped by the
-    // migrator (no depositFor(amount=0) revert) while the rest migrate successfully.
-    function test_underwaterMigration_tinyPositionRoundsToZero_skipped() public {
-        // carol stakes 1 base unit; with a deep haircut her pro-rata share floors to 0.
-        address carol = address(0xCA401);
-        _fundAndStake(carol, 1); // 1 base unit of USDC
+    // ============================== POST-CHECK GUARD (incomplete exit) ==============================
 
-        MockYieldStrategy strategy = _routeOldThroughStrategy(); // sweeps 400e6 + 1
-        assertEq(strategy.principalOf(address(usdc), address(oldStaker)), 400_000_001);
+    // A strategy that cannot fully exit (leaves principalOf > 0) makes initiateMigration revert on the
+    // post-check. UnderRealizingStrategy caps withdraw to only part of principal per call.
+    function test_postCheck_incompleteExitReverts() public {
+        UnderRealizingStrategy strat = new UnderRealizingStrategy();
+        strat.setClient(address(oldStaker), true);
+        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strat)));
 
-        strategy.setValueFactorBps(5_000); // 50% loss
+        vm.prank(address(migrator));
+        vm.expectRevert(bytes("StableStaker: incomplete exit"));
+        oldStaker.initiateMigration(address(usdc));
+    }
 
-        address[] memory users = new address[](3);
-        users[0] = alice;
-        users[1] = bob;
-        users[2] = carol;
+    // ============================== TERMINAL / DECOUPLING ==============================
 
-        // Must not revert despite carol's share flooring to 0.
-        migrator.migrate(address(usdc), users);
+    // After initiateMigration the strategy wiring is cleared (decoupled) and allowance revoked.
+    function test_initiate_decouplesStrategy() public {
+        MockYieldStrategy strategy = _routeOldThroughStrategy();
+        migrator.initiateMigration(address(usdc));
+        assertEq(address(oldStaker.yieldStrategy(address(usdc))), address(0));
+        assertEq(usdc.allowance(address(oldStaker), address(strategy)), 0);
+    }
+}
 
-        // carol skipped on the new staker (depositFor never called with 0).
-        (uint256 cNew,) = newStaker.userInfo(address(usdc), carol);
-        assertEq(cNew, 0);
-        // but her old position is still drained.
-        (uint256 cOld,) = oldStaker.userInfo(address(usdc), carol);
-        assertEq(cOld, 0);
+/// @notice Strategy whose withdraw only realizes part of the requested principal per call, leaving
+///         principalOf > 0 so {StableStaker.initiateMigration}'s post-check trips. Models a
+///         tranche/queue vault that cannot exit atomically.
+contract UnderRealizingStrategy is IYieldStrategy {
+    using SafeERC20 for IERC20;
 
-        // alice & bob migrated with their pro-rata share.
-        (uint256 aNew,) = newStaker.userInfo(address(usdc), alice);
-        (uint256 bNew,) = newStaker.userInfo(address(usdc), bob);
-        assertGt(aNew, 0);
-        assertGt(bNew, 0);
+    mapping(address => mapping(address => uint256)) public principal;
+    mapping(address => bool) public clients;
+
+    function setClient(address client, bool a) external override {
+        clients[client] = a;
+    }
+
+    function deposit(address token, uint256 amount, address recipient) external override {
+        require(clients[msg.sender], "unauth");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        principal[token][recipient] += amount;
+    }
+
+    // Only ever realizes HALF the requested principal, leaving a residual ⇒ principalOf > 0.
+    function withdraw(address token, uint256 amount, address recipient) external override {
+        require(clients[msg.sender], "unauth");
+        uint256 avail = principal[token][recipient];
+        if (amount > avail) amount = avail;
+        uint256 realize = amount / 2;
+        principal[token][recipient] -= realize;
+        if (realize > 0) IERC20(token).safeTransfer(recipient, realize);
+    }
+
+    function principalOf(address token, address account) external view override returns (uint256) {
+        return principal[token][account];
+    }
+
+    function totalBalanceOf(address token, address account) external view override returns (uint256) {
+        return principal[token][account];
+    }
+
+    function balanceOf(address token, address account) external view override returns (uint256) {
+        return principal[token][account];
+    }
+
+    function emergencyWithdraw(uint256) external override {}
+    function totalWithdrawal(address, address) external override {}
+
+    function skimSurplus(address, address) external pure override returns (uint256) {
+        return 0;
+    }
+
+    function getAuthorizedClients() external pure override returns (address[] memory) {
+        return new address[](0);
+    }
+    function setSetAsideBuffer(address, uint256) external override {}
+
+    function setAsideBufferSize(address) external pure override returns (uint256) {
+        return 0;
     }
 }

@@ -54,7 +54,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     /// @notice Address authorized to pause the contract (Behodler3 pattern). Satisfies IPausable.
     address public override pauser;
 
-    /// @notice Address authorized to perform permissioned migration (migrateOut / depositFor).
+    /// @notice Address authorized to perform permissioned migration (initiateMigration / batchMigrate / depositFor).
     address public migrator;
 
     /// @notice Per-token reward pool accounting.
@@ -88,6 +88,21 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     ///      yield accrued inside the strategy is protocol-owned and never credited to stakers.
     mapping(address => IYieldStrategy) public yieldStrategy;
 
+    /// @notice Per-token terminal-migration snapshot (see the TERMINAL MIGRATION section).
+    /// @dev `active` is terminal: once true for a token it can never be cleared, and that token's
+    ///      pool can never resume healthy operation on this contract. `realized` (R) and
+    ///      `principalSnapshot` (P) are captured once in {initiateMigration} and are immutable for the
+    ///      life of the migration — every user's credit divides by this fixed `P`, never a re-summed
+    ///      batch total, which is what makes payouts order- and method-independent.
+    struct MigrationInfo {
+        bool active; // terminal once true
+        uint256 realized; // R: token realized into this contract by the full strategy exit
+        uint256 principalSnapshot; // P: poolInfo[token].totalStaked captured at initiateMigration
+    }
+
+    /// @notice token => terminal-migration snapshot. `active == false` ⇒ healthy operation.
+    mapping(address => MigrationInfo) public migrationInfo;
+
     // ============================== EVENTS ==============================
 
     event TokenAdded(address indexed token);
@@ -100,6 +115,8 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     event Claimed(address indexed token, address indexed user, uint256 reward);
     event EmergencyWithdrawn(address indexed token, address indexed user, uint256 amount);
     event MigratedOut(address indexed token, address indexed user, uint256 amount, uint256 reward);
+    event MigrationInitiated(address indexed token, uint256 realized, uint256 principalSnapshot);
+    event UserMigrated(address indexed token, address indexed user, uint256 credit);
     event DepositedFor(address indexed token, address indexed user, uint256 amount);
     event BufferWithdrawn(address indexed token, address indexed user, uint256 amount);
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
@@ -220,6 +237,9 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     /// @notice Stake `amount` of `token`. Any pending reward is minted to the caller first.
     function stake(address token, uint256 amount) external nonReentrant whenNotPaused poolExists(token) {
         require(amount > 0, "StableStaker: amount=0");
+        // Frozen once terminal migration is engaged: new stake would pollute the immutable `P`
+        // snapshot. See TERMINAL MIGRATION.
+        require(!migrationInfo[token].active, "StableStaker: migrating");
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage user = userInfo[token][msg.sender];
@@ -237,6 +257,9 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     /// @notice Withdraw `amount` of staked `token`. Any pending reward is minted to the caller.
     function withdraw(address token, uint256 amount) external nonReentrant whenNotPaused poolExists(token) {
         require(amount > 0, "StableStaker: amount=0");
+        // Frozen once terminal migration is engaged: exits go through {userMigrate}, which honours the
+        // fixed (R, P) snapshot. A live withdraw would change `P`. See TERMINAL MIGRATION.
+        require(!migrationInfo[token].active, "StableStaker: migrating");
         PoolInfo storage pool = poolInfo[token];
         UserInfo storage user = userInfo[token][msg.sender];
         require(user.amount >= amount, "StableStaker: insufficient stake");
@@ -278,6 +301,9 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      *         broken mint path can never trap principal.
      */
     function emergencyWithdraw(address token) external nonReentrant {
+        // Frozen once terminal migration is engaged: the escape hatch becomes {userMigrate}, which
+        // pays the fixed snapshot credit. A live exit here would change `P`. See TERMINAL MIGRATION.
+        require(!migrationInfo[token].active, "StableStaker: migrating");
         UserInfo storage user = userInfo[token][msg.sender];
         uint256 amount = user.amount;
         require(amount > 0, "StableStaker: nothing staked");
@@ -291,67 +317,200 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         emit EmergencyWithdrawn(token, msg.sender, amount);
     }
 
-    // ============================== MIGRATION ==============================
+    // ============================== TERMINAL MIGRATION ==============================
 
     /**
-     * @notice Permissioned batched exit (see {IStableStaker-migrateOut}). Settles and mints each
-     *         user's pending reward, zeroes their position, and transfers the aggregate principal
-     *         to the migrator. Callable while paused so a migration can proceed during an incident.
+     * @dev Terminal, per-token migration mode — a dormant incident / protocol-upgrade escape hatch.
+     *      It may never fire, or fire once years from now operated by someone who has never seen the
+     *      original design notes; the on-chain source must therefore explain the *why*, not just the
+     *      *what*. (The design plan in scratchpad is NOT shipped and is not the explanation of record.)
+     *
+     *      Motivation. The legacy per-batch `migrateOut` re-credited an underwater migration pro-rata,
+     *      but recomputed the haircut ratio per batch. Through an AMM-backed strategy each batch's
+     *      aggregate exit moved the pool price, so two users with identical principal received
+     *      materially different payouts based solely on batch placement (finding ss2m1 / M-01). This
+     *      design collapses realization to a single event and distributes a single, fixed snapshot.
+     *
+     *      Lifecycle. {initiateMigration} runs once per token: it settles & freezes emissions, snapshots
+     *      P = totalStaked, realizes the whole strategy position into idle balance as R, decouples the
+     *      strategy, and sets `active = true`. Thereafter every exit — operator {batchMigrate} or
+     *      permissionless {userMigrate} — pays a credit that is a pure function of the snapshot:
+     *
+     *          credit_i = p_i * min(R, P) / P            (p_i = user's snapshot principal)
+     *
+     *      Because R and P are immutable for the migration's life and the denominator is the fixed P
+     *      (never a re-summed batch total), the payout is independent of exit order, batch composition,
+     *      and batch-vs-self. Equal principal ⇒ equal payout. That is the formal statement of the fix.
+     *
+     *      Terminal by design. Once engaged, the token's pool can never resume healthy operation here:
+     *      there is no resume path. This is deliberate — the motivating events (protocol upgrade, the
+     *      underlying vault winding down) have no healthy state to return to, and re-entry would make
+     *      the snapshot ratio stale against a re-grown position and open resume races. Removing the
+     *      resume path removes that entire class of bugs.
+     *
+     *      Conservation. With S = min(R, P): Σ floor(p_i·S/P) ≤ (S/P)·Σ p_i = S ≤ R. The idle pile (R)
+     *      always covers every credit in any interleaving of batch/self exits — the last claimer is
+     *      never starved. Floor-division dust stays protocol-owned (owner-rescuable via {rescueERC20}).
      */
-    function migrateOut(address token, address[] calldata users)
+
+    /**
+     * @notice Engage terminal migration for `token`: realize the entire strategy position once and
+     *         snapshot (R, P) so all subsequent exits pay a fixed, order-independent pro-rata credit.
+     * @dev Permission: `onlyMigrator` (the migration orchestrator owns the whole flow; the migrator
+     *      exposes a thin owner-only forwarder). Idempotency: reverts if `token` is already migrating,
+     *      so this runs exactly once. After it succeeds `token` is terminal — no resume path exists.
+     *
+     *      Emissions are settled to this block and then frozen ({_updatePool} no-ops while active), so
+     *      every user's pending phUSD is fixed at the snapshot and is minted in full on their exit.
+     * @param token The staked token to put into terminal migration. Must be a registered pool and not
+     *              already migrating.
+     */
+    function initiateMigration(address token) external nonReentrant onlyMigrator poolExists(token) {
+        require(!migrationInfo[token].active, "StableStaker: already migrating");
+
+        // Settle rewards to this block; subsequent _updatePool calls are frozen once `active` is set,
+        // so pending phUSD is now fixed at the snapshot for every migrating user.
+        _updatePool(token);
+
+        // P: the immutable principal denominator. Held in lockstep with strategy.principalOf, so passing
+        // it to _routeExit requests exactly the strategy-side client principal.
+        uint256 P = poolInfo[token].totalStaked;
+        IYieldStrategy strategy = yieldStrategy[token];
+
+        // Realize the full position via the client-callable, synchronous strategy.withdraw (through
+        // _routeExit with the underwater guard OFF). `totalWithdrawal` is deliberately NOT used despite
+        // appearing in IYieldStrategy: it is onlyOwner (this contract is only a client), two-phase with
+        // a 24h delay (no atomic realization), and redeems to the strategy *owner*, not this client —
+        // so the funds would never land here. withdraw caps the request to available principal, draining
+        // the client fully. When no strategy is set, _routeExit returns P (principal already idle ⇒ R = P).
+        uint256 R = _routeExit(token, P, false);
+
+        // Post-check the exit fully drained the client (a tranche/queue vault that can only exit
+        // partially would understate R and strand value — terminal mode gives no retry). Skipped when
+        // no strategy is set.
+        require(
+            address(strategy) == address(0) || strategy.principalOf(token, address(this)) == 0,
+            "StableStaker: incomplete exit"
+        );
+
+        // Decouple the strategy: revoke its allowance and clear the wiring. The contract is now an
+        // honest idle-hold for `token`; the migration paths pay from this idle pile only.
+        if (address(strategy) != address(0)) {
+            IERC20(token).forceApprove(address(strategy), 0);
+            yieldStrategy[token] = IYieldStrategy(address(0));
+        }
+
+        // Surplus is NOT swept. withdraw caps payout at par, so R ≤ P structurally; any above-par yield
+        // stays inside the now-decoupled strategy as protocol-owned value and never reaches users (the
+        // "stakers get principal + phUSD only" invariant holds). min(R, P) below is therefore == R in
+        // practice but defends against a stray above-par R (e.g. a donation) by capping credits at par.
+        migrationInfo[token] = MigrationInfo({active: true, realized: R, principalSnapshot: P});
+        emit MigrationInitiated(token, R, P);
+    }
+
+    /**
+     * @notice Permissioned batched exit during terminal migration (see {IStableStaker-batchMigrate}).
+     *         Replaces the legacy `migrateOut`. For each non-zero user: mints their frozen pending
+     *         phUSD, zeroes their position, and accumulates the snapshot credit `p_i·min(R,P)/P`. The
+     *         aggregate is transferred to the migrator from the idle pile; the migrator redeposits each
+     *         per-user credit into the new staker.
+     * @dev Permission: `onlyMigrator`. Requires a prior {initiateMigration} (`active`). No `_routeExit`,
+     *      no per-batch re-sum, no requested-vs-received delta — credits come solely from the immutable
+     *      (R, P) snapshot, so they are identical regardless of batch composition or ordering, and a
+     *      user who already self-migrated (position zeroed) is skipped automatically. Callable while
+     *      paused so a migration can proceed during an incident.
+     * @param token The token under terminal migration.
+     * @param users The users to migrate out (build batches off-chain via getStakers/getStakersRange).
+     * @return amounts Per-user snapshot credit `p_i·min(R,P)/P`, parallel to `users` (0 for empty /
+     *         already-migrated positions). Σ amounts ≤ R, so the migrator's redeposits can never exceed
+     *         the funds it received.
+     */
+    function batchMigrate(address token, address[] calldata users)
         external
         nonReentrant
         onlyMigrator
         poolExists(token)
         returns (uint256[] memory amounts)
     {
-        PoolInfo storage pool = poolInfo[token];
-        _updatePool(token);
-        amounts = new uint256[](users.length);
-        uint256 totalPrincipal;
-        for (uint256 i = 0; i < users.length; i++) {
-            address u = users[i];
-            UserInfo storage info = userInfo[token][u];
-            uint256 amt = info.amount;
-            if (amt == 0) {
-                continue;
-            }
-            uint256 pending = (amt * pool.accPhusdPerShare) / ACC_PRECISION - info.rewardDebt;
-            info.amount = 0;
-            info.rewardDebt = 0;
-            pool.totalStaked -= amt;
-            _stakers[token].remove(u);
-            amounts[i] = amt;
-            totalPrincipal += amt;
-            if (pending > 0) {
-                phUSD.mint(u, pending);
-            }
-            emit MigratedOut(token, u, amt, pending);
-        }
-        if (totalPrincipal > 0) {
-            // Redeem the aggregate principal in a single strategy call (the farm is one client).
-            // No underwater guard: a below-par migration delivers the redeemed (haircut) amount.
-            uint256 payout = _routeExit(token, totalPrincipal, false);
-            IERC20(token).safeTransfer(msg.sender, payout);
+        require(migrationInfo[token].active, "StableStaker: not migrating");
 
-            // M-01 fix: when below par, the migrator only holds `payout` (< totalPrincipal). Re-credit
-            // users on the REALIZED basis so Σ amounts[i] <= payout and the migrator's redeposits can
-            // never exceed the funds it received. Division dust (payout - Σ scaled) stays in the migrator
-            // (protocol-owned). At/above par payout == totalPrincipal, so scaling is an identity and is skipped.
-            if (payout < totalPrincipal) {
-                for (uint256 i = 0; i < users.length; i++) {
-                    if (amounts[i] > 0) {
-                        amounts[i] = (amounts[i] * payout) / totalPrincipal;
-                    }
-                }
-            }
+        amounts = new uint256[](users.length);
+        uint256 total;
+        for (uint256 i = 0; i < users.length; i++) {
+            // Empty or already self-migrated positions return 0 and are skipped (no separate flag).
+            uint256 credit = _exitPosition(token, users[i]);
+            amounts[i] = credit;
+            total += credit;
+        }
+        if (total > 0) {
+            // Pay from the idle pile realized at initiateMigration. No strategy round-trip.
+            IERC20(token).safeTransfer(msg.sender, total);
         }
     }
+
+    /**
+     * @dev Shared terminal-migration exit for one user: mints their frozen pending phUSD, computes the
+     *      snapshot credit `p_i·min(R,P)/P`, zeroes their position and removes them from the staker set.
+     *      Returns the credit (0 for an empty position). Used by both {batchMigrate} and {userMigrate},
+     *      so a self-migrated user and a batch-migrated user with equal principal get identical credit.
+     *      Does NOT transfer the credit — the caller forwards it (CEI).
+     */
+    function _exitPosition(address token, address account) internal returns (uint256 credit) {
+        UserInfo storage info = userInfo[token][account];
+        uint256 amt = info.amount;
+        if (amt == 0) {
+            return 0;
+        }
+        MigrationInfo storage mig = migrationInfo[token];
+        uint256 P = mig.principalSnapshot;
+        uint256 S = mig.realized < P ? mig.realized : P; // min(R, P): caps credits at par
+        credit = (amt * S) / P;
+
+        // Pending was frozen at the snapshot (_updatePool is a no-op while active).
+        PoolInfo storage pool = poolInfo[token];
+        uint256 pending = (amt * pool.accPhusdPerShare) / ACC_PRECISION - info.rewardDebt;
+
+        info.amount = 0;
+        info.rewardDebt = 0;
+        pool.totalStaked -= amt;
+        _stakers[token].remove(account);
+
+        if (pending > 0) {
+            phUSD.mint(account, pending);
+        }
+        emit MigratedOut(token, account, credit, pending);
+    }
+
+    /**
+     * @notice Permissionless terminal-migration exit: the caller redeems their own position for the
+     *         fixed snapshot credit `p_i·min(R,P)/P` and exits the system entirely (tokens to their
+     *         own wallet — they are NOT re-deposited into the new staker).
+     * @dev The escape hatch for the terminal state, replacing {emergencyWithdraw} (which is blocked
+     *      while migrating). Requires `active` and a non-zero position. Strict CEI: the position is
+     *      zeroed before the transfer. Pays the SAME credit a batch exit would, so it is order- and
+     *      method-independent; a later {batchMigrate} skips this user automatically.
+     * @param token The token under terminal migration.
+     */
+    function userMigrate(address token) external nonReentrant {
+        require(migrationInfo[token].active, "StableStaker: not migrating");
+        require(userInfo[token][msg.sender].amount > 0, "StableStaker: nothing staked");
+
+        // Effects (mint pending, zero position, remove from set) happen inside _exitPosition; the
+        // transfer below is the only interaction, so CEI holds.
+        uint256 credit = _exitPosition(token, msg.sender);
+        IERC20(token).safeTransfer(msg.sender, credit);
+        emit UserMigrated(token, msg.sender, credit);
+    }
+
+    // ============================== MIGRATION (DEPOSIT) ==============================
 
     /**
      * @notice Permissioned deposit crediting `user` (see {IStableStaker-depositFor}). Pulls
      *         `amount` of `token` from the migrator. Callable while paused so a freshly deployed
      *         (and possibly paused) target can be seeded.
+     * @dev On a token under terminal migration this is the OLD staker and is blocked (would change the
+     *      `P` snapshot). The migrator's redeposit target is the NEW (healthy) staker, where this
+     *      guard does not trip.
      */
     function depositFor(address token, address user, uint256 amount)
         external
@@ -360,6 +519,8 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         poolExists(token)
     {
         require(amount > 0, "StableStaker: amount=0");
+        // Frozen on the migrating (old) staker: a deposit would change `P`. See TERMINAL MIGRATION.
+        require(!migrationInfo[token].active, "StableStaker: migrating");
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage info = userInfo[token][user];
@@ -377,10 +538,12 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     // ============================== VIEWS ==============================
 
     /// @notice Projected pending phUSD reward for `account` in `token`'s pool.
+    /// @dev While terminal migration is active, emissions are frozen at the snapshot, so this returns
+    ///      the fixed pending (no forward projection) — matching what the migration exit mints.
     function pendingReward(address token, address account) external view returns (uint256) {
         PoolInfo storage pool = poolInfo[token];
         uint256 acc = pool.accPhusdPerShare;
-        if (block.timestamp > pool.lastRewardTime && pool.totalStaked > 0) {
+        if (!migrationInfo[token].active && block.timestamp > pool.lastRewardTime && pool.totalStaked > 0) {
             uint256 elapsed = block.timestamp - pool.lastRewardTime;
             uint256 reward = elapsed * pool.phusdPerSecond;
             acc += (reward * ACC_PRECISION) / pool.totalStaked;
@@ -439,6 +602,12 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
 
     /// @dev Accrue rewards for `token` up to the current block. Empty pools accrue nothing.
     function _updatePool(address token) internal {
+        // Emissions are frozen once terminal migration is engaged: each user's pending phUSD stays
+        // fixed at the {initiateMigration} snapshot, so it is minted in full on their migration exit.
+        // See TERMINAL MIGRATION.
+        if (migrationInfo[token].active) {
+            return;
+        }
         PoolInfo storage pool = poolInfo[token];
         if (block.timestamp <= pool.lastRewardTime) {
             return;
