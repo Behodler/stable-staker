@@ -14,7 +14,12 @@ interface IStableStaker {
      *         all withdrawn principal is transferred to the caller (the migrator).
      * @param token  The staked token whose positions are being migrated out.
      * @param users  The users to migrate.
-     * @return amounts Per-user principal withdrawn, parallel to `users` (0 for empty positions).
+     * @return amounts Per-user amount actually re-credited, parallel to `users` (0 for empty positions).
+     *         At or above par these equal each user's requested principal. Below par the strategy
+     *         delivers a haircut, so each non-zero entry is scaled to its REALIZED, pro-rata share of
+     *         the redeemed payout (`requested * payout / totalRequested`, floored), guaranteeing the
+     *         sum never exceeds the funds transferred to the migrator. Floor-division dust accrues to
+     *         the protocol (left in the migrator).
      */
     function migrateOut(address token, address[] calldata users) external returns (uint256[] memory amounts);
 

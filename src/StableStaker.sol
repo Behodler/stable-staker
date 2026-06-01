@@ -333,6 +333,18 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
             // No underwater guard: a below-par migration delivers the redeemed (haircut) amount.
             uint256 payout = _routeExit(token, totalPrincipal, false);
             IERC20(token).safeTransfer(msg.sender, payout);
+
+            // M-01 fix: when below par, the migrator only holds `payout` (< totalPrincipal). Re-credit
+            // users on the REALIZED basis so Σ amounts[i] <= payout and the migrator's redeposits can
+            // never exceed the funds it received. Division dust (payout - Σ scaled) stays in the migrator
+            // (protocol-owned). At/above par payout == totalPrincipal, so scaling is an identity and is skipped.
+            if (payout < totalPrincipal) {
+                for (uint256 i = 0; i < users.length; i++) {
+                    if (amounts[i] > 0) {
+                        amounts[i] = (amounts[i] * payout) / totalPrincipal;
+                    }
+                }
+            }
         }
     }
 
