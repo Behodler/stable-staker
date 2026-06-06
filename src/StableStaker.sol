@@ -246,12 +246,13 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         _settle(msg.sender, user, pool);
 
         uint256 received = _pullToken(token, msg.sender, amount);
-        _routeDeposit(token, received);
-        user.amount += received;
-        pool.totalStaked += received;
+        uint256 credited = _routeDeposit(token, received);
+        require(credited > 0, "StableStaker: nothing credited");
+        user.amount += credited;
+        pool.totalStaked += credited;
         user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
         _stakers[token].add(msg.sender);
-        emit Staked(token, msg.sender, received);
+        emit Staked(token, msg.sender, credited);
     }
 
     /// @notice Withdraw `amount` of staked `token`. Any pending reward is minted to the caller.
@@ -527,12 +528,12 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         _settle(user, info, pool);
 
         uint256 received = _pullToken(token, msg.sender, amount);
-        _routeDeposit(token, received);
-        info.amount += received;
-        pool.totalStaked += received;
+        uint256 credited = _routeDeposit(token, received);
+        info.amount += credited;
+        pool.totalStaked += credited;
         info.rewardDebt = (info.amount * pool.accPhusdPerShare) / ACC_PRECISION;
         _stakers[token].add(user);
-        emit DepositedFor(token, user, received);
+        emit DepositedFor(token, user, credited);
     }
 
     // ============================== VIEWS ==============================
@@ -648,13 +649,16 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         return strategy.totalBalanceOf(token, address(this)) < strategy.principalOf(token, address(this));
     }
 
-    /// @dev If a strategy is set for `token`, deposit `amount` into it under this contract's account.
-    ///      No-op (idle hold) when unset. Reward/principal accounting always uses `amount` regardless.
-    function _routeDeposit(address token, uint256 amount) internal {
+    /// @dev If a strategy is set for `token`, deposit `amount` into it under this contract's
+    ///      account and return the principal the strategy actually booked (the market strategy
+    ///      haircuts this below `amount`; direct strategies return `amount`). When no strategy is
+    ///      set the tokens sit idle in this contract, so the full `amount` is credited.
+    function _routeDeposit(address token, uint256 amount) internal returns (uint256 credited) {
         IYieldStrategy strategy = yieldStrategy[token];
-        if (address(strategy) != address(0)) {
-            strategy.deposit(token, amount, address(this));
+        if (address(strategy) == address(0)) {
+            return amount; // idle hold: full credit
         }
+        return strategy.deposit(token, amount, address(this));
     }
 
     /**

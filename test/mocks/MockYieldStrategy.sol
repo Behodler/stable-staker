@@ -40,6 +40,9 @@ contract MockYieldStrategy is IYieldStrategy {
     /// @notice Value factor in basis points. 10000 = par; <10000 = underwater; >10000 = yield.
     uint256 public valueFactorBps = 10_000;
 
+    /// @notice Deposit slippage in basis points. 0 = full credit (default, preserves old behaviour).
+    uint256 public depositSlippageBps;
+
     constructor() {
         owner = msg.sender;
     }
@@ -61,6 +64,11 @@ contract MockYieldStrategy is IYieldStrategy {
         valueFactorBps = bps;
     }
 
+    /// @notice Set the deposit slippage (basis points). 0 = full credit; >0 books less than `amount`.
+    function setDepositSlippageBps(uint256 bps) external {
+        depositSlippageBps = bps;
+    }
+
     // ============ IYieldStrategy CORE ============
 
     function deposit(address token, uint256 amount, address recipient)
@@ -70,10 +78,11 @@ contract MockYieldStrategy is IYieldStrategy {
         returns (uint256 creditedPrincipal)
     {
         require(amount > 0, "MockYieldStrategy: amount=0");
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        principal[token][recipient] += amount;
-        totalPrincipal[token] += amount;
-        return amount;
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount); // full amount pulled in
+        creditedPrincipal = (amount * (10_000 - depositSlippageBps)) / 10_000;
+        principal[token][recipient] += creditedPrincipal; // only the haircut is booked
+        totalPrincipal[token] += creditedPrincipal;
+        return creditedPrincipal;
     }
 
     function withdraw(address token, uint256 amount, address recipient) external override onlyClient {

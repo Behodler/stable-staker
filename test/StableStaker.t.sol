@@ -357,4 +357,93 @@ contract StableStakerTest is Test {
         staker.rescueERC20(address(stray), owner, 3 ether);
         assertEq(stray.balanceOf(owner), 3 ether);
     }
+
+    // ---------------------------------------------------------- deposit slippage
+
+    event Staked(address indexed token, address indexed user, uint256 amount);
+    event DepositedFor(address indexed token, address indexed user, uint256 amount);
+
+    /// @dev Wire a fresh slippage strategy for usdc and return it.
+    function _slippageStrategy(uint256 bps) internal returns (MockYieldStrategy strategy) {
+        strategy = new MockYieldStrategy();
+        strategy.setClient(address(staker), true);
+        strategy.setDepositSlippageBps(bps);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy)));
+    }
+
+    function test_stake_throughSlippage_creditsHaircut() public {
+        MockYieldStrategy strategy = _slippageStrategy(100); // 1% haircut
+        uint256 amount = 100e6;
+        uint256 expected = (amount * 9900) / 10_000; // 99e6
+
+        vm.expectEmit(true, true, false, true);
+        emit Staked(address(usdc), alice, expected);
+        _stake(alice, address(usdc), amount);
+
+        (uint256 booked,) = staker.userInfo(address(usdc), alice);
+        assertEq(booked, expected);
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, expected);
+        assertEq(strategy.principalOf(address(usdc), address(staker)), expected);
+    }
+
+    function test_depositFor_throughSlippage_creditsHaircut() public {
+        MockYieldStrategy strategy = _slippageStrategy(250); // 2.5% haircut
+        staker.setMigrator(owner);
+        uint256 amount = 200e6;
+        uint256 expected = (amount * 9750) / 10_000; // 195e6
+
+        usdc.approve(address(staker), type(uint256).max);
+        usdc.mint(owner, amount);
+
+        vm.expectEmit(true, true, false, true);
+        emit DepositedFor(address(usdc), bob, expected);
+        staker.depositFor(address(usdc), bob, amount);
+
+        (uint256 booked,) = staker.userInfo(address(usdc), bob);
+        assertEq(booked, expected);
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, expected);
+        assertEq(strategy.principalOf(address(usdc), address(staker)), expected);
+    }
+
+    function test_stake_noStrategy_creditsFullAmount() public {
+        // No strategy set on usdc (regression: idle hold credits full amount).
+        _stake(alice, address(usdc), 100e6);
+        (uint256 booked,) = staker.userInfo(address(usdc), alice);
+        assertEq(booked, 100e6);
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, 100e6);
+    }
+
+    function test_stake_strategyAtPar_creditsFullAmount() public {
+        MockYieldStrategy strategy = _slippageStrategy(0); // par
+        _stake(alice, address(usdc), 100e6);
+        (uint256 booked,) = staker.userInfo(address(usdc), alice);
+        assertEq(booked, 100e6);
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 100e6);
+    }
+
+    function test_stakeUnderSlippage_thenFullWithdraw_consistent() public {
+        _slippageStrategy(100); // 1% haircut
+        uint256 amount = 100e6;
+        uint256 expected = (amount * 9900) / 10_000; // 99e6
+
+        _stake(alice, address(usdc), amount);
+        (uint256 booked,) = staker.userInfo(address(usdc), alice);
+        assertEq(booked, expected);
+
+        // Full-position withdraw requests exactly the booked principal — the strategy holds
+        // exactly that, so it returns ~credited with no leftover/over-draw.
+        uint256 balBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        staker.withdraw(address(usdc), booked);
+
+        assertEq(usdc.balanceOf(alice), balBefore + expected);
+        (uint256 after_,) = staker.userInfo(address(usdc), alice);
+        assertEq(after_, 0);
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, 0);
+        assertEq(staker.stakerCount(address(usdc)), 0);
+    }
 }
