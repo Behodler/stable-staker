@@ -545,10 +545,15 @@ contract UnderRealizingStrategy is IYieldStrategy {
         clients[client] = a;
     }
 
-    function deposit(address token, uint256 amount, address recipient) external override {
+    function deposit(address token, uint256 amount, address recipient)
+        external
+        override
+        returns (uint256 creditedPrincipal)
+    {
         require(clients[msg.sender], "unauth");
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         principal[token][recipient] += amount;
+        return amount;
     }
 
     // Only ever realizes HALF the requested principal, leaving a residual ⇒ principalOf > 0.

@@ -63,11 +63,17 @@ contract MockYieldStrategy is IYieldStrategy {
 
     // ============ IYieldStrategy CORE ============
 
-    function deposit(address token, uint256 amount, address recipient) external override onlyClient {
+    function deposit(address token, uint256 amount, address recipient)
+        external
+        override
+        onlyClient
+        returns (uint256 creditedPrincipal)
+    {
         require(amount > 0, "MockYieldStrategy: amount=0");
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         principal[token][recipient] += amount;
         totalPrincipal[token] += amount;
+        return amount;
     }
 
     function withdraw(address token, uint256 amount, address recipient) external override onlyClient {
