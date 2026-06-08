@@ -127,6 +127,10 @@ contract MockYieldStrategy is IYieldStrategy {
 
     // ============ IYieldStrategy UNUSED-BY-STAKER STUBS ============
 
+    function relinquishPrincipal(address, uint256) external override onlyClient {}
+
+    function relinquishPrincipalAsOwner(address, uint256) external override {}
+
     function emergencyWithdraw(uint256) external override {}
 
     function totalWithdrawal(address, address) external override {}

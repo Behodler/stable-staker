@@ -578,6 +578,8 @@ contract UnderRealizingStrategy is IYieldStrategy {
         return principal[token][account];
     }
 
+    function relinquishPrincipal(address, uint256) external override {}
+    function relinquishPrincipalAsOwner(address, uint256) external override {}
     function emergencyWithdraw(uint256) external override {}
     function totalWithdrawal(address, address) external override {}
 
