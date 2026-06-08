@@ -9,6 +9,7 @@ import "flax-token/FlaxToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /// @notice Terminal migration mode: an operator engages a one-time (R, P) snapshot on the old staker
 ///         and moves users to the new staker. Payouts are a fixed pro-rata of the snapshot, so they are
@@ -315,7 +316,7 @@ contract MigrationTest is Test {
 
         // Above-par realized R was capped at par by withdraw, so R == P == 400e6: no surplus reached
         // anyone, and no above-par yield was credited.
-        (, uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
         assertEq(R, 400e6);
         assertEq(P, 400e6);
         // no dust stranded in the migrator
@@ -331,7 +332,7 @@ contract MigrationTest is Test {
         strategy.setValueFactorBps(9_000); // 10% loss
 
         migrator.initiateMigration(address(usdc));
-        (, uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
         assertEq(R, 360e6); // 400e6 * 0.9
         assertEq(P, 400e6);
 
@@ -360,7 +361,7 @@ contract MigrationTest is Test {
         strategy.setValueFactorBps(8_333); // non-clean divisions
 
         migrator.initiateMigration(address(usdc));
-        (, uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
 
         migrator.migrate(address(usdc), _users());
 
@@ -383,7 +384,7 @@ contract MigrationTest is Test {
         strategy.setValueFactorBps(8_333);
 
         migrator.initiateMigration(address(usdc));
-        (, uint256 R,) = oldStaker.migrationInfo(address(usdc));
+        (uint256 R,) = oldStaker.migrationInfo(address(usdc));
 
         // realized R now sits idle in the old staker
         assertEq(usdc.balanceOf(address(oldStaker)), R);
@@ -414,7 +415,7 @@ contract MigrationTest is Test {
         usdc.mint(alice, 1e6);
         vm.startPrank(alice);
         usdc.approve(address(oldStaker), type(uint256).max);
-        vm.expectRevert(bytes("StableStaker: migrating"));
+        vm.expectRevert(bytes("StableStaker: pool not active"));
         oldStaker.stake(address(usdc), 1e6);
         vm.stopPrank();
     }
@@ -422,14 +423,14 @@ contract MigrationTest is Test {
     function test_guard_withdrawBlockedWhileMigrating() public {
         migrator.initiateMigration(address(usdc));
         vm.prank(alice);
-        vm.expectRevert(bytes("StableStaker: migrating"));
+        vm.expectRevert(bytes("StableStaker: pool not active"));
         oldStaker.withdraw(address(usdc), 1e6);
     }
 
     function test_guard_emergencyWithdrawBlockedWhileMigrating() public {
         migrator.initiateMigration(address(usdc));
         vm.prank(alice);
-        vm.expectRevert(bytes("StableStaker: migrating"));
+        vm.expectRevert(bytes("StableStaker: pool not active"));
         oldStaker.emergencyWithdraw(address(usdc));
     }
 
@@ -437,27 +438,27 @@ contract MigrationTest is Test {
         migrator.initiateMigration(address(usdc));
         // depositFor must come from the migrator; it is blocked on the OLD (migrating) staker.
         vm.prank(address(migrator));
-        vm.expectRevert(bytes("StableStaker: migrating"));
+        vm.expectRevert(bytes("StableStaker: pool not active"));
         oldStaker.depositFor(address(usdc), alice, 1e6);
     }
 
     function test_guard_userMigrateRevertsWhenNotMigrating() public {
         vm.prank(alice);
-        vm.expectRevert(bytes("StableStaker: not migrating"));
+        vm.expectRevert(bytes("StableStaker: pool not migrating"));
         oldStaker.userMigrate(address(usdc));
     }
 
     function test_guard_batchMigrateRevertsWithoutInitiate() public {
         vm.prank(address(migrator));
-        vm.expectRevert(bytes("StableStaker: not migrating"));
+        vm.expectRevert(bytes("StableStaker: pool not migrating"));
         oldStaker.batchMigrate(address(usdc), _users());
     }
 
     function test_guard_initiateMigrationRevertsWhenAlreadyActive() public {
         migrator.initiateMigration(address(usdc));
-        // terminal: cannot be re-initiated
+        // terminal: cannot be re-initiated (pool is no longer Active)
         vm.prank(address(migrator));
-        vm.expectRevert(bytes("StableStaker: already migrating"));
+        vm.expectRevert(bytes("StableStaker: pool not active"));
         oldStaker.initiateMigration(address(usdc));
     }
 
@@ -494,8 +495,8 @@ contract MigrationTest is Test {
     function test_noStrategy_setsRequalP_creditsPar() public {
         // setUp leaves the old staker with no strategy: principal sits idle.
         migrator.initiateMigration(address(usdc));
-        (bool active, uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
-        assertTrue(active);
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Migrating));
         assertEq(R, 400e6);
         assertEq(P, 400e6);
 
@@ -529,6 +530,229 @@ contract MigrationTest is Test {
         migrator.initiateMigration(address(usdc));
         assertEq(address(oldStaker.yieldStrategy(address(usdc))), address(0));
         assertEq(usdc.allowance(address(oldStaker), address(strategy)), 0);
+    }
+
+    // ============================== STATE MACHINE / LIFECYCLE (STORY 009) ==============================
+
+    // Assert the legal operations for each state and that illegal ops revert with the new messages.
+    function test_stateMachine_illegalOpsRevertPerState() public {
+        // --- Active state: migration-only ops are rejected ---
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+        vm.prank(address(migrator));
+        vm.expectRevert(bytes("StableStaker: pool not migrating"));
+        oldStaker.batchMigrate(address(usdc), _users());
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: pool not migrating"));
+        oldStaker.userMigrate(address(usdc));
+        // finalizeAndReset is illegal while Active (pool not migrating)
+        vm.expectRevert(bytes("StableStaker: pool not migrating"));
+        oldStaker.finalizeAndReset(address(usdc));
+
+        // --- Active -> Migrating ---
+        migrator.initiateMigration(address(usdc));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Migrating));
+
+        // While Migrating: stake / withdraw / setYieldStrategy / initiateMigration all revert.
+        usdc.mint(alice, 1e6);
+        vm.startPrank(alice);
+        usdc.approve(address(oldStaker), type(uint256).max);
+        vm.expectRevert(bytes("StableStaker: pool not active"));
+        oldStaker.stake(address(usdc), 1e6);
+        vm.expectRevert(bytes("StableStaker: pool not active"));
+        oldStaker.withdraw(address(usdc), 1e6);
+        vm.stopPrank();
+        MockYieldStrategy fresh = new MockYieldStrategy();
+        fresh.setClient(address(oldStaker), true);
+        vm.expectRevert(bytes("StableStaker: pool not active"));
+        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(fresh)));
+        vm.prank(address(migrator));
+        vm.expectRevert(bytes("StableStaker: pool not active"));
+        oldStaker.initiateMigration(address(usdc));
+
+        // finalizeAndReset reverts while stakers / principal remain.
+        vm.expectRevert(bytes("StableStaker: stakers remain"));
+        oldStaker.finalizeAndReset(address(usdc));
+
+        // Drain everyone out, then reset succeeds.
+        vm.prank(address(migrator));
+        oldStaker.batchMigrate(address(usdc), _users());
+        assertEq(oldStaker.stakerCount(address(usdc)), 0);
+        (,,, uint256 totalStaked) = oldStaker.poolInfo(address(usdc));
+        assertEq(totalStaked, 0);
+
+        oldStaker.finalizeAndReset(address(usdc));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertEq(R, 0);
+        assertEq(P, 0);
+    }
+
+    // finalizeAndReset must reject a pool that still has principal even if the staker set is empty
+    // (defense-in-depth: both invariants are checked independently).
+    function test_finalizeAndReset_rejectsNonZeroPrincipal() public {
+        migrator.initiateMigration(address(usdc));
+        // Migrate only alice out; bob's 300e6 principal remains -> totalStaked > 0, stakerCount > 0.
+        address[] memory justAlice = new address[](1);
+        justAlice[0] = alice;
+        vm.prank(address(migrator));
+        oldStaker.batchMigrate(address(usdc), justAlice);
+        vm.expectRevert(bytes("StableStaker: stakers remain"));
+        oldStaker.finalizeAndReset(address(usdc));
+    }
+
+    // End-to-end REVIVAL: stake -> push underwater -> initiateMigration -> eject everyone (batch + self)
+    // verifying credits at min(R,P)/P -> finalizeAndReset -> setYieldStrategy(fresh) -> a NEW staker
+    // stakes at par with correct fresh reward accounting, and no stale position can withdraw.
+    function test_revival_endToEnd_underwaterEjectResetRestake() public {
+        // Route old staker's principal through a strategy and push it 10% underwater.
+        MockYieldStrategy strategy = _routeOldThroughStrategy();
+        strategy.setValueFactorBps(9_000); // R = 0.9 * P
+
+        // Accrue a day of rewards before migration so frozen pending is non-zero.
+        vm.warp(block.timestamp + 1 days);
+        uint256 pendingAlice = oldStaker.pendingReward(address(usdc), alice);
+
+        migrator.initiateMigration(address(usdc));
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertEq(P, 400e6);
+        assertEq(R, 360e6); // 90% of 400e6
+
+        // Alice self-migrates; Bob is batch-migrated. Both paid p_i * min(R,P)/P = 0.9 * p_i.
+        uint256 aliceBalBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        oldStaker.userMigrate(address(usdc));
+        assertEq(usdc.balanceOf(alice) - aliceBalBefore, 90e6); // 0.9 * 100e6
+        assertEq(phUSD.balanceOf(alice), pendingAlice); // frozen pending minted
+
+        address[] memory justBob = new address[](1);
+        justBob[0] = bob;
+        vm.prank(address(migrator));
+        uint256[] memory amts = oldStaker.batchMigrate(address(usdc), justBob);
+        assertEq(amts[0], 270e6); // 0.9 * 300e6 (migrator received the credit)
+
+        // Pool is now fully drained.
+        assertEq(oldStaker.stakerCount(address(usdc)), 0);
+        (,,, uint256 drained) = oldStaker.poolInfo(address(usdc));
+        assertEq(drained, 0);
+
+        // Reset the SAME pool back to Active.
+        vm.expectEmit(true, false, false, false);
+        emit StableStaker.PoolReset(address(usdc));
+        oldStaker.finalizeAndReset(address(usdc));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+
+        // Wire a FRESH, at-par strategy (old wiring was cleared to address(0) at initiateMigration,
+        // so 008's underwater guard is skipped here).
+        MockYieldStrategy fresh = new MockYieldStrategy();
+        fresh.setClient(address(oldStaker), true);
+        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(fresh)));
+
+        // A brand-new staker (carol) can stake at par into the revived pool.
+        address carol = address(0xCA401);
+        usdc.mint(carol, 500e6);
+        vm.startPrank(carol);
+        usdc.approve(address(oldStaker), type(uint256).max);
+        oldStaker.stake(address(usdc), 500e6);
+        vm.stopPrank();
+        (uint256 carolAmt,) = oldStaker.userInfo(address(usdc), carol);
+        assertEq(carolAmt, 500e6);
+        assertEq(fresh.principalOf(address(usdc), address(oldStaker)), 500e6);
+
+        // Fresh reward accounting: rewards accrue from the reset, NOT retroactively over the frozen gap.
+        // Carol is the only staker, so a day's emission accrues entirely to her.
+        assertEq(oldStaker.pendingReward(address(usdc), carol), 0);
+        vm.warp(block.timestamp + 1 days);
+        assertApproxEqAbs(oldStaker.pendingReward(address(usdc), carol), PER_DAY, 1e6);
+
+        // No stale position survives: alice/bob were zeroed, so they cannot withdraw.
+        (uint256 aStale,) = oldStaker.userInfo(address(usdc), alice);
+        (uint256 bStale,) = oldStaker.userInfo(address(usdc), bob);
+        assertEq(aStale, 0);
+        assertEq(bStale, 0);
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: insufficient stake"));
+        oldStaker.withdraw(address(usdc), 1);
+
+        // Carol can withdraw her full principal at par from the revived pool.
+        uint256 carolBefore = usdc.balanceOf(carol);
+        vm.prank(carol);
+        oldStaker.withdraw(address(usdc), 500e6);
+        assertEq(usdc.balanceOf(carol) - carolBefore, 500e6);
+    }
+
+    // Paused revival: setYieldStrategy and finalizeAndReset succeed while paused (onlyOwner, no
+    // whenNotPaused), but stake reverts until unpause.
+    function test_revival_whilePaused() public {
+        oldStaker.setPauser(owner);
+
+        migrator.initiateMigration(address(usdc));
+        oldStaker.pause();
+
+        // Eject everyone (migration hooks are callable while paused).
+        vm.prank(address(migrator));
+        oldStaker.batchMigrate(address(usdc), _users());
+        assertEq(oldStaker.stakerCount(address(usdc)), 0);
+
+        // finalizeAndReset succeeds while paused.
+        oldStaker.finalizeAndReset(address(usdc));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+
+        // setYieldStrategy succeeds while paused.
+        MockYieldStrategy fresh = new MockYieldStrategy();
+        fresh.setClient(address(oldStaker), true);
+        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(fresh)));
+
+        // stake is whenNotPaused -> reverts until unpause.
+        address carol = address(0xCA402);
+        usdc.mint(carol, 100e6);
+        vm.startPrank(carol);
+        usdc.approve(address(oldStaker), type(uint256).max);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        oldStaker.stake(address(usdc), 100e6);
+        vm.stopPrank();
+
+        // After unpause, stake works.
+        oldStaker.unpause();
+        vm.prank(carol);
+        oldStaker.stake(address(usdc), 100e6);
+        (uint256 carolAmt,) = oldStaker.userInfo(address(usdc), carol);
+        assertEq(carolAmt, 100e6);
+    }
+
+    // Idle-hold revival: a reset Active pool with no strategy fully credits a stake as an idle hold,
+    // and a subsequent setYieldStrategy(fresh) sweeps that idle balance into the new strategy at par.
+    function test_revival_idleHoldThenStrategySweep() public {
+        migrator.initiateMigration(address(usdc));
+        vm.prank(address(migrator));
+        oldStaker.batchMigrate(address(usdc), _users());
+        oldStaker.finalizeAndReset(address(usdc));
+
+        // Pool is Active with yieldStrategy == address(0): a stake is credited in full as idle hold.
+        assertEq(address(oldStaker.yieldStrategy(address(usdc))), address(0));
+        address carol = address(0xCA403);
+        usdc.mint(carol, 250e6);
+        vm.startPrank(carol);
+        usdc.approve(address(oldStaker), type(uint256).max);
+        oldStaker.stake(address(usdc), 250e6);
+        vm.stopPrank();
+        (uint256 carolAmt,) = oldStaker.userInfo(address(usdc), carol);
+        assertEq(carolAmt, 250e6);
+        assertEq(usdc.balanceOf(address(oldStaker)), 250e6); // sitting idle in-contract
+
+        // Wiring a fresh strategy sweeps the idle balance into it at par; accounting stays consistent.
+        MockYieldStrategy fresh = new MockYieldStrategy();
+        fresh.setClient(address(oldStaker), true);
+        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(fresh)));
+        assertEq(fresh.principalOf(address(usdc), address(oldStaker)), 250e6);
+        assertEq(usdc.balanceOf(address(oldStaker)), 0); // swept out of idle
+
+        // Carol withdraws full principal at par from the now strategy-backed pool — no desync.
+        uint256 carolBefore = usdc.balanceOf(carol);
+        vm.prank(carol);
+        oldStaker.withdraw(address(usdc), 250e6);
+        assertEq(usdc.balanceOf(carol) - carolBefore, 250e6);
+        (,,, uint256 totalAfter) = oldStaker.poolInfo(address(usdc));
+        assertEq(totalAfter, 0);
     }
 }
 

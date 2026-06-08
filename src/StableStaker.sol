@@ -88,19 +88,35 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     ///      yield accrued inside the strategy is protocol-owned and never credited to stakers.
     mapping(address => IYieldStrategy) public yieldStrategy;
 
+    /// @notice Per-token pool lifecycle state. The pool is a small, explicit state machine; every
+    ///         operational gate reads {poolState} (NOT a boolean inside {MigrationInfo}, which was
+    ///         removed in favour of this enum). Two legal states and ONLY two transitions:
+    ///           - Active   -> Migrating: {initiateMigration} (onlyMigrator), one-way per engagement.
+    ///           - Migrating -> Active:   {finalizeAndReset} (onlyOwner), allowed ONLY once the pool
+    ///                                     is fully drained (`stakerCount == 0 && totalStaked == 0`).
+    /// @dev The zero value MUST be `Active` so all currently-registered, never-migrated tokens keep
+    ///      behaving exactly as before (matches the legacy `active == false` default). `poolState` is
+    ///      the sole source of truth for migration gating.
+    enum PoolState {
+        Active,
+        Migrating
+    }
+
+    /// @notice token => pool lifecycle state. Default 0 == Active.
+    mapping(address => PoolState) public poolState;
+
     /// @notice Per-token terminal-migration snapshot (see the TERMINAL MIGRATION section).
-    /// @dev `active` is terminal: once true for a token it can never be cleared, and that token's
-    ///      pool can never resume healthy operation on this contract. `realized` (R) and
-    ///      `principalSnapshot` (P) are captured once in {initiateMigration} and are immutable for the
-    ///      life of the migration — every user's credit divides by this fixed `P`, never a re-summed
-    ///      batch total, which is what makes payouts order- and method-independent.
+    /// @dev `realized` (R) and `principalSnapshot` (P) are captured once in {initiateMigration} and are
+    ///      immutable for the life of the migration — every user's credit divides by this fixed `P`,
+    ///      never a re-summed batch total, which is what makes payouts order- and method-independent.
+    ///      Whether a token IS migrating is tracked by {poolState}, not by a flag in this struct.
+    ///      {finalizeAndReset} zeroes both fields when returning a fully-drained pool to Active.
     struct MigrationInfo {
-        bool active; // terminal once true
         uint256 realized; // R: token realized into this contract by the full strategy exit
         uint256 principalSnapshot; // P: poolInfo[token].totalStaked captured at initiateMigration
     }
 
-    /// @notice token => terminal-migration snapshot. `active == false` ⇒ healthy operation.
+    /// @notice token => terminal-migration snapshot. Meaningful only while `poolState[token] == Migrating`.
     mapping(address => MigrationInfo) public migrationInfo;
 
     // ============================== EVENTS ==============================
@@ -120,6 +136,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     event DepositedFor(address indexed token, address indexed user, uint256 amount);
     event BufferWithdrawn(address indexed token, address indexed user, uint256 amount);
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
+    event PoolReset(address indexed token);
 
     // ============================== MODIFIERS ==============================
 
@@ -200,7 +217,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      *      (`strategy.setClient(address(this), true)`) before deposits will succeed.
      */
     function setYieldStrategy(address token, IYieldStrategy strategy) external onlyOwner poolExists(token) {
-        require(!migrationInfo[token].active, "StableStaker: migrating");
+        require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
 
         IYieldStrategy old = yieldStrategy[token];
         if (address(old) != address(0)) {
@@ -265,7 +282,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         require(amount > 0, "StableStaker: amount=0");
         // Frozen once terminal migration is engaged: new stake would pollute the immutable `P`
         // snapshot. See TERMINAL MIGRATION.
-        require(!migrationInfo[token].active, "StableStaker: migrating");
+        require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage user = userInfo[token][msg.sender];
@@ -286,7 +303,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         require(amount > 0, "StableStaker: amount=0");
         // Frozen once terminal migration is engaged: exits go through {userMigrate}, which honours the
         // fixed (R, P) snapshot. A live withdraw would change `P`. See TERMINAL MIGRATION.
-        require(!migrationInfo[token].active, "StableStaker: migrating");
+        require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
         PoolInfo storage pool = poolInfo[token];
         UserInfo storage user = userInfo[token][msg.sender];
         require(user.amount >= amount, "StableStaker: insufficient stake");
@@ -330,7 +347,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     function emergencyWithdraw(address token) external nonReentrant {
         // Frozen once terminal migration is engaged: the escape hatch becomes {userMigrate}, which
         // pays the fixed snapshot credit. A live exit here would change `P`. See TERMINAL MIGRATION.
-        require(!migrationInfo[token].active, "StableStaker: migrating");
+        require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
         UserInfo storage user = userInfo[token][msg.sender];
         uint256 amount = user.amount;
         require(amount > 0, "StableStaker: nothing staked");
@@ -358,10 +375,11 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      *      materially different payouts based solely on batch placement (finding ss2m1 / M-01). This
      *      design collapses realization to a single event and distributes a single, fixed snapshot.
      *
-     *      Lifecycle. {initiateMigration} runs once per token: it settles & freezes emissions, snapshots
-     *      P = totalStaked, realizes the whole strategy position into idle balance as R, decouples the
-     *      strategy, and sets `active = true`. Thereafter every exit — operator {batchMigrate} or
-     *      permissionless {userMigrate} — pays a credit that is a pure function of the snapshot:
+     *      Lifecycle. {initiateMigration} runs once per engagement: it settles & freezes emissions,
+     *      snapshots P = totalStaked, realizes the whole strategy position into idle balance as R,
+     *      decouples the strategy, and sets `poolState = Migrating`. Thereafter every exit — operator
+     *      {batchMigrate} or permissionless {userMigrate} — pays a credit that is a pure function of
+     *      the snapshot:
      *
      *          credit_i = p_i * min(R, P) / P            (p_i = user's snapshot principal)
      *
@@ -369,11 +387,14 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      *      (never a re-summed batch total), the payout is independent of exit order, batch composition,
      *      and batch-vs-self. Equal principal ⇒ equal payout. That is the formal statement of the fix.
      *
-     *      Terminal by design. Once engaged, the token's pool can never resume healthy operation here:
-     *      there is no resume path. This is deliberate — the motivating events (protocol upgrade, the
-     *      underlying vault winding down) have no healthy state to return to, and re-entry would make
-     *      the snapshot ratio stale against a re-grown position and open resume races. Removing the
-     *      resume path removes that entire class of bugs.
+     *      Terminal per engagement; revival only from empty. While Migrating the token's pool can never
+     *      resume healthy operation: there is no in-place resume, so the snapshot ratio can never go
+     *      stale against a re-grown position and there are no resume races. The ONLY way back to Active
+     *      is {finalizeAndReset}, which is gated on a FULLY-DRAINED pool (`stakerCount == 0 &&
+     *      totalStaked == 0`): once every position has exited at the fixed snapshot, the empty pool
+     *      carries no stale state, so it can be cleared and re-opened under a fresh strategy. This
+     *      preserves the no-stale-snapshot guarantee (you can only revive from empty) while removing the
+     *      "pool slot frozen forever / redeploy required" limitation.
      *
      *      Conservation. With S = min(R, P): Σ floor(p_i·S/P) ≤ (S/P)·Σ p_i = S ≤ R. The idle pile (R)
      *      always covers every credit in any interleaving of batch/self exits — the last claimer is
@@ -384,18 +405,19 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      * @notice Engage terminal migration for `token`: realize the entire strategy position once and
      *         snapshot (R, P) so all subsequent exits pay a fixed, order-independent pro-rata credit.
      * @dev Permission: `onlyMigrator` (the migration orchestrator owns the whole flow; the migrator
-     *      exposes a thin owner-only forwarder). Idempotency: reverts if `token` is already migrating,
-     *      so this runs exactly once. After it succeeds `token` is terminal — no resume path exists.
+     *      exposes a thin owner-only forwarder). Reverts unless the pool is `Active`, so this runs once
+     *      per engagement. After it succeeds `token` is `Migrating` — the only way back to `Active` is
+     *      {finalizeAndReset}, gated on a fully-drained pool.
      *
-     *      Emissions are settled to this block and then frozen ({_updatePool} no-ops while active), so
+     *      Emissions are settled to this block and then frozen ({_updatePool} no-ops while Migrating), so
      *      every user's pending phUSD is fixed at the snapshot and is minted in full on their exit.
      * @param token The staked token to put into terminal migration. Must be a registered pool and not
      *              already migrating.
      */
     function initiateMigration(address token) external nonReentrant onlyMigrator poolExists(token) {
-        require(!migrationInfo[token].active, "StableStaker: already migrating");
+        require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
 
-        // Settle rewards to this block; subsequent _updatePool calls are frozen once `active` is set,
+        // Settle rewards to this block; subsequent _updatePool calls are frozen once Migrating is set,
         // so pending phUSD is now fixed at the snapshot for every migrating user.
         _updatePool(token);
 
@@ -427,11 +449,15 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
             yieldStrategy[token] = IYieldStrategy(address(0));
         }
 
+        // Engage the terminal-migration state. `poolState` is the sole gate source; the snapshot below
+        // is meaningful only while Migrating and is zeroed by {finalizeAndReset} on revival.
+        poolState[token] = PoolState.Migrating;
+
         // Surplus is NOT swept. withdraw caps payout at par, so R ≤ P structurally; any above-par yield
         // stays inside the now-decoupled strategy as protocol-owned value and never reaches users (the
         // "stakers get principal + phUSD only" invariant holds). min(R, P) below is therefore == R in
         // practice but defends against a stray above-par R (e.g. a donation) by capping credits at par.
-        migrationInfo[token] = MigrationInfo({active: true, realized: R, principalSnapshot: P});
+        migrationInfo[token] = MigrationInfo({realized: R, principalSnapshot: P});
         emit MigrationInitiated(token, R, P);
     }
 
@@ -459,7 +485,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         poolExists(token)
         returns (uint256[] memory amounts)
     {
-        require(migrationInfo[token].active, "StableStaker: not migrating");
+        require(poolState[token] == PoolState.Migrating, "StableStaker: pool not migrating");
 
         amounts = new uint256[](users.length);
         uint256 total;
@@ -519,7 +545,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      * @param token The token under terminal migration.
      */
     function userMigrate(address token) external nonReentrant {
-        require(migrationInfo[token].active, "StableStaker: not migrating");
+        require(poolState[token] == PoolState.Migrating, "StableStaker: pool not migrating");
         require(userInfo[token][msg.sender].amount > 0, "StableStaker: nothing staked");
 
         // Effects (mint pending, zero position, remove from set) happen inside _exitPosition; the
@@ -527,6 +553,46 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         uint256 credit = _exitPosition(token, msg.sender);
         IERC20(token).safeTransfer(msg.sender, credit);
         emit UserMigrated(token, msg.sender, credit);
+    }
+
+    /**
+     * @notice Return a fully-ejected pool from terminal migration (Migrating) back to a clean,
+     *         re-stakeable Active state, so the SAME token can be revived under a fresh strategy
+     *         without redeploying.
+     * @dev Permission: `onlyOwner`. Deliberately has NO `whenNotPaused` so the operator can reset
+     *      while paused (the recommended revival runbook wraps the reconfiguration in pause/unpause).
+     *
+     *      This ONLY applies to the fully-ejected terminal-migration path: it requires
+     *      `poolState == Migrating` AND an empty, zero-principal pool (`stakerCount == 0 &&
+     *      totalStaked == 0`), meaning every position has already exited via {batchMigrate} /
+     *      {userMigrate} at the immutable `(R, P)` snapshot. The empty-pool requirement is the core
+     *      safety property: no stale `userInfo` position can survive into the revived pool to
+     *      cannibalize a future staker's real principal.
+     *
+     *      An IMPAIRED / underwater strategy reaches this path ONLY via {initiateMigration} (which
+     *      socializes the loss proportionally via the `(R, P)` snapshot) — NEVER via an in-place
+     *      {setYieldStrategy} swap, which story 008's underwater guard forbids. There is intentionally
+     *      no seamless underwater-flee; survivors are paid `min(R,P)/P` and must re-stake.
+     *
+     *      O(1): asserts `stakerCount == 0` rather than iterating the staker set (the bounded ejection
+     *      work is done by the migrator's paged {batchMigrate} loop). Clears the `(R, P)` snapshot and
+     *      fast-forwards `lastRewardTime` to now so the frozen migration gap is never retro-accrued
+     *      (belt-and-suspenders given `_updatePool`'s `totalStaked == 0` fast-forward). After reset
+     *      `yieldStrategy[token]` is still `address(0)` (cleared during {initiateMigration}); the owner
+     *      then calls {setYieldStrategy} to wire a fresh strategy before users stake again.
+     * @param token The token whose fully-drained migrating pool should be reset to Active.
+     */
+    function finalizeAndReset(address token) external onlyOwner poolExists(token) {
+        require(poolState[token] == PoolState.Migrating, "StableStaker: pool not migrating");
+        require(_stakers[token].length() == 0, "StableStaker: stakers remain");
+        require(poolInfo[token].totalStaked == 0, "StableStaker: principal remains");
+
+        // Clear the snapshot and fast-forward accrual so the frozen migration window is never
+        // retroactively emitted into the revived pool.
+        migrationInfo[token] = MigrationInfo({realized: 0, principalSnapshot: 0});
+        poolInfo[token].lastRewardTime = block.timestamp;
+        poolState[token] = PoolState.Active;
+        emit PoolReset(token);
     }
 
     // ============================== MIGRATION (DEPOSIT) ==============================
@@ -547,7 +613,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     {
         require(amount > 0, "StableStaker: amount=0");
         // Frozen on the migrating (old) staker: a deposit would change `P`. See TERMINAL MIGRATION.
-        require(!migrationInfo[token].active, "StableStaker: migrating");
+        require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage info = userInfo[token][user];
@@ -570,7 +636,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     function pendingReward(address token, address account) external view returns (uint256) {
         PoolInfo storage pool = poolInfo[token];
         uint256 acc = pool.accPhusdPerShare;
-        if (!migrationInfo[token].active && block.timestamp > pool.lastRewardTime && pool.totalStaked > 0) {
+        if (poolState[token] == PoolState.Active && block.timestamp > pool.lastRewardTime && pool.totalStaked > 0) {
             uint256 elapsed = block.timestamp - pool.lastRewardTime;
             uint256 reward = elapsed * pool.phusdPerSecond;
             acc += (reward * ACC_PRECISION) / pool.totalStaked;
@@ -632,7 +698,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
         // Emissions are frozen once terminal migration is engaged: each user's pending phUSD stays
         // fixed at the {initiateMigration} snapshot, so it is minted in full on their migration exit.
         // See TERMINAL MIGRATION.
-        if (migrationInfo[token].active) {
+        if (poolState[token] != PoolState.Active) {
             return;
         }
         PoolInfo storage pool = poolInfo[token];

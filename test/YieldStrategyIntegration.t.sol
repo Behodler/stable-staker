@@ -572,13 +572,12 @@ contract YieldStrategyIntegrationTest is Test {
         // Engage terminal migration: holds the realized payout pile as idle balance, decoupled.
         vm.prank(migrator);
         staker.initiateMigration(address(usdc));
-        (bool active,,) = staker.migrationInfo(address(usdc));
-        assertTrue(active);
+        assertEq(uint256(staker.poolState(address(usdc))), uint256(StableStaker.PoolState.Migrating));
 
         // setYieldStrategy must now be blocked — an unguarded sweep would brick userMigrate/batchMigrate.
         MockYieldStrategy strategy2 = new MockYieldStrategy();
         strategy2.setClient(address(staker), true);
-        vm.expectRevert(bytes("StableStaker: migrating"));
+        vm.expectRevert(bytes("StableStaker: pool not active"));
         staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
     }
 
@@ -606,8 +605,7 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(usdc.allowance(address(staker), address(strategy)), 0);
         assertEq(usdc.allowance(address(staker), address(strategy2)), type(uint256).max);
         // No migration was engaged.
-        (bool active,,) = staker.migrationInfo(address(usdc));
-        assertFalse(active);
+        assertEq(uint256(staker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
 
         // A subsequent withdraw resolves against YS2.
         uint256 balBefore = usdc.balanceOf(alice);
