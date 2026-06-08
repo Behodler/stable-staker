@@ -188,16 +188,34 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      * @notice Set (or clear, with address(0)) the yield strategy that custodies `token`'s principal.
      * @dev On set to a non-zero strategy: approves it for unlimited `token` and sweeps any idle balance
      *      already held by the contract into the new strategy (so subsequent withdrawals resolve against
-     *      it). When clearing or replacing, the old strategy's allowance is reset to 0. Replacing an
-     *      in-use strategy does NOT migrate funds out of the old one (see CLAUDE.md / story Concerns):
-     *      drain the old strategy or replace only while `totalStaked == 0`.
+     *      it). When clearing or replacing, the old strategy is best-effort drained (its full client
+     *      position is withdrawn into this contract via the same realization path as
+     *      {initiateMigration}, underwater guard OFF) and its allowance is reset to 0; the recovered
+     *      idle balance is then re-custodied into the new strategy by the idle sweep. The whole
+     *      position therefore moves YS1->YS2 in this single call, with no per-user migration.
+     *      Above-par yield is left behind in the decoupled old strategy as protocol-owned value
+     *      (StableStaker credits users principal only). Blocked during a terminal migration.
      *
      *      Wiring prerequisite: the strategy owner must authorize this contract as a client
      *      (`strategy.setClient(address(this), true)`) before deposits will succeed.
      */
     function setYieldStrategy(address token, IYieldStrategy strategy) external onlyOwner poolExists(token) {
+        require(!migrationInfo[token].active, "StableStaker: migrating");
+
         IYieldStrategy old = yieldStrategy[token];
         if (address(old) != address(0)) {
+            // Drain the full client position out of the old strategy into this contract so the new
+            // strategy (or idle hold) can re-custody it. Best-effort: caps at recoverable principal,
+            // underwater guard OFF — same realization path as initiateMigration. Above-par yield is
+            // left behind in the old strategy as protocol-owned value (StableStaker owes users
+            // principal only). `_routeExit` reads yieldStrategy[token], which is still `old` here.
+            // Skip when there is no principal to realize: the strategy's withdraw reverts on a
+            // zero amount, so a drain at totalStaked == 0 must be a no-op (first-adoption / idle).
+            uint256 staked = poolInfo[token].totalStaked;
+            if (staked > 0) {
+                _routeExit(token, staked, false);
+            }
+
             // Revoke the old strategy's spending allowance.
             IERC20(token).forceApprove(address(old), 0);
         }

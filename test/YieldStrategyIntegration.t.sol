@@ -501,4 +501,79 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(usdc.balanceOf(address(strategy)), strategyBalBefore - 100e6);
         assertEq(usdc.balanceOf(address(strategy)), 50e6);
     }
+
+    // ------------------------------------------ M-02 guard: blocked during terminal migration
+
+    function test_setYieldStrategy_revertsDuringActiveMigration() public {
+        _setStrategy();
+        _stake(alice, 100e6);
+
+        // Engage terminal migration: holds the realized payout pile as idle balance, decoupled.
+        vm.prank(migrator);
+        staker.initiateMigration(address(usdc));
+        (bool active,,) = staker.migrationInfo(address(usdc));
+        assertTrue(active);
+
+        // setYieldStrategy must now be blocked — an unguarded sweep would brick userMigrate/batchMigrate.
+        MockYieldStrategy strategy2 = new MockYieldStrategy();
+        strategy2.setClient(address(staker), true);
+        vm.expectRevert(bytes("StableStaker: migrating"));
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
+    }
+
+    // ------------------------------------------ swap: YS1 -> YS2 drains old, re-custodies, no migration
+
+    function test_setYieldStrategy_swap_drainsOldAndReCustodiesIntoNew() public {
+        _setStrategy(); // YS1
+        _stake(alice, 100e6);
+        _stake(bob, 300e6);
+
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, 400e6);
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 400e6);
+
+        // Swap to YS2 in a single owner call — no initiateMigration, no per-user migration.
+        MockYieldStrategy strategy2 = new MockYieldStrategy();
+        strategy2.setClient(address(staker), true);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
+
+        // Old strategy fully drained; whole position re-custodied into the new strategy.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 400e6);
+        // Mapping repointed; allowances flipped.
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy2));
+        assertEq(usdc.allowance(address(staker), address(strategy)), 0);
+        assertEq(usdc.allowance(address(staker), address(strategy2)), type(uint256).max);
+        // No migration was engaged.
+        (bool active,,) = staker.migrationInfo(address(usdc));
+        assertFalse(active);
+
+        // A subsequent withdraw resolves against YS2.
+        uint256 balBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 100e6);
+        assertEq(usdc.balanceOf(alice), balBefore + 100e6);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 300e6);
+    }
+
+    // ------------------------------------------ swap from a failing (underwater) vault: best-effort
+
+    function test_setYieldStrategy_swap_fromUnderwaterVault_recoversWhatItCan_noRevert() public {
+        _setStrategy(); // YS1
+        _stake(alice, 100e6);
+
+        // YS1 vault impaired: only pays 90% on exit. The swap must NOT revert (escape hatch).
+        strategy.setValueFactorBps(9_000);
+
+        MockYieldStrategy strategy2 = new MockYieldStrategy();
+        strategy2.setClient(address(staker), true);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
+
+        // Old fully drained of principal; new strategy funded with what was recovered (90e6 < totalStaked).
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 90e6);
+        // totalStaked is NOT rewritten — pool is now underwater on the new strategy.
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, 100e6);
+    }
 }

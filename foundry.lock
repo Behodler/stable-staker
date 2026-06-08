@@ -1,0 +1,20 @@
+{
+  "lib/flax-token": {
+    "rev": "f5300117e94bd30349fb88f426d434ef1ccddce0"
+  },
+  "lib/forge-std": {
+    "rev": "620536fa5277db4e3fd46772d5cbc1ea0696fb43"
+  },
+  "lib/openzeppelin-contracts": {
+    "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
+  },
+  "lib/pauser": {
+    "rev": "545928d067a3dd7ffb853ce41ced7177a34febf1"
+  },
+  "lib/reflax-yield-vault": {
+    "branch": {
+      "name": "master",
+      "rev": "2306719d8f992b31f00ba228cbca9f8768447197"
+    }
+  }
+}
