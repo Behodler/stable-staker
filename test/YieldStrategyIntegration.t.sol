@@ -617,24 +617,113 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(strategy2.principalOf(address(usdc), address(staker)), 300e6);
     }
 
-    // ------------------------------------------ swap from a failing (underwater) vault: best-effort
+    // ------------------------------------------ M-06: swapping an underwater strategy reverts
 
-    function test_setYieldStrategy_swap_fromUnderwaterVault_recoversWhatItCan_noRevert() public {
+    /// @dev M-06: an in-place swap of an underwater (below-par) strategy is FORBIDDEN. Swapping
+    ///      while below par would silently lift the underwater-withdraw block and FCFS-concentrate
+    ///      the realized loss on the last withdrawer. Impaired strategies must be wound down via the
+    ///      fair, snapshot-based terminal-migration path instead. The guard reverts before any drain.
+    function test_setYieldStrategy_swap_fromUnderwaterVault_reverts() public {
         _setStrategy(); // YS1
         _stake(alice, 100e6);
 
-        // YS1 vault impaired: only pays 90% on exit. The swap must NOT revert (escape hatch).
+        // YS1 vault impaired: only pays 90% on exit (below par => underwater).
         strategy.setValueFactorBps(9_000);
+        assertTrue(staker.withdrawDisabled(address(usdc)));
+
+        MockYieldStrategy strategy2 = new MockYieldStrategy();
+        strategy2.setClient(address(staker), true);
+
+        // The swap must revert — no state change, no token movement.
+        vm.expectRevert(bytes("StableStaker: old strategy underwater"));
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
+
+        // Nothing moved: old strategy still holds the full principal, mapping unchanged.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 100e6);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 0);
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
+    }
+
+    // ------------------------------------------ M-06: at-par swap still succeeds
+
+    function test_setYieldStrategy_swap_atPar_succeeds() public {
+        _setStrategy(); // YS1
+        _stake(alice, 100e6);
+        _stake(bob, 300e6);
+
+        // Exactly at par (factorBps == 10000).
+        strategy.setValueFactorBps(10_000);
+        assertFalse(staker.withdrawDisabled(address(usdc)));
 
         MockYieldStrategy strategy2 = new MockYieldStrategy();
         strategy2.setClient(address(staker), true);
         staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
 
-        // Old fully drained of principal; new strategy funded with what was recovered (90e6 < totalStaked).
+        // Whole position drained out of YS1 and re-custodied at par into YS2 — accounting consistent.
         assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
-        assertEq(strategy2.principalOf(address(usdc), address(staker)), 90e6);
-        // totalStaked is NOT rewritten — pool is now underwater on the new strategy.
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 400e6);
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy2));
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, 400e6);
+        assertFalse(staker.withdrawDisabled(address(usdc)));
+    }
+
+    // ------------------------------------------ M-06: above-par swap succeeds, yield left behind
+
+    function test_setYieldStrategy_swap_abovePar_succeeds_yieldLeftBehind() public {
+        _setStrategy(); // YS1
+        _stake(alice, 100e6);
+
+        // 20% yield growth in YS1 (factorBps > 10000): strategy holds 120e6 of value, 100e6 principal.
+        strategy.setValueFactorBps(12_000);
+        assertFalse(staker.withdrawDisabled(address(usdc)));
+
+        MockYieldStrategy strategy2 = new MockYieldStrategy();
+        strategy2.setClient(address(staker), true);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
+
+        // Principal (100e6) re-custodied at par into YS2; the drain caps the redeem at par so the
+        // above-par yield is never pulled out and stays behind in the decoupled old strategy as
+        // protocol-owned value (StableStaker credits users principal only).
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 100e6);
+        // The old strategy's principal book is zeroed; any above-par surplus remains protocol-owned
+        // and is not custodied for the farm anymore (the mock only ever held the 100e6 deposited).
+        assertEq(strategy.totalBalanceOf(address(usdc), address(staker)), 0);
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy2));
         (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
         assertEq(totalStaked, 100e6);
+        assertFalse(staker.withdrawDisabled(address(usdc)));
+    }
+
+    // ------------------------------------------ M-06: empty / first-adoption swaps succeed
+
+    function test_setYieldStrategy_swap_emptyOldStrategy_succeeds() public {
+        // Adopt YS1 but never stake into it: principalOf == 0, so it is NOT underwater (0 < 0 false),
+        // even with the value factor pushed below par. The guard must permit the swap.
+        _setStrategy(); // YS1
+        strategy.setValueFactorBps(9_000);
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
+
+        MockYieldStrategy strategy2 = new MockYieldStrategy();
+        strategy2.setClient(address(staker), true);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
+
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy2));
+        assertEq(usdc.allowance(address(staker), address(strategy)), 0);
+        assertEq(usdc.allowance(address(staker), address(strategy2)), type(uint256).max);
+    }
+
+    function test_setYieldStrategy_firstAdoption_noOldStrategy_succeeds() public {
+        // No old strategy at all (address(0)): the guarded block is skipped entirely.
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(0));
+        _stake(alice, 100e6); // idle hold before adoption
+
+        _setStrategy(); // first adoption
+
+        // Idle balance swept into the freshly adopted strategy.
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 100e6);
+        assertEq(usdc.balanceOf(address(staker)), 0);
     }
 }

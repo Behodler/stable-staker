@@ -204,6 +204,14 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
 
         IYieldStrategy old = yieldStrategy[token];
         if (address(old) != address(0)) {
+            // M-06: refuse to swap an underwater strategy in place. Swapping while below par
+            // silently lifts the underwater-withdraw block and FCFS-concentrates the realized
+            // loss on the last withdrawer. An impaired strategy must instead be wound down via
+            // initiateMigration -> batchMigrate -> finalizeAndReset, which socializes the loss
+            // proportionally via the (R,P) snapshot. At/above par swaps are unaffected. An empty
+            // old strategy (principalOf == 0) is not underwater, so first-adoption/idle swaps pass.
+            require(!_isUnderwater(token, old), "StableStaker: old strategy underwater");
+
             // Drain the full client position out of the old strategy into this contract so the new
             // strategy (or idle hold) can re-custody it. Best-effort: caps at recoverable principal,
             // underwater guard OFF — same realization path as initiateMigration. Above-par yield is
