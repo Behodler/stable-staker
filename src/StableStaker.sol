@@ -700,6 +700,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
             // "use the buffer" by returning `amount` without touching the strategy.
             if (t.balanceOf(address(this)) >= amount) {
                 emit BufferWithdrawn(token, msg.sender, amount);
+                strategy.relinquishPrincipal(token, amount);
                 return amount;
             }
             revert("StableStaker: strategy underwater");

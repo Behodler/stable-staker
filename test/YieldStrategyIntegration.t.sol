@@ -235,9 +235,9 @@ contract YieldStrategyIntegrationTest is Test {
         strategy.setValueFactorBps(9_000);
         assertTrue(staker.withdrawDisabled(address(usdc)));
 
-        // Buffer >= amount → withdraw served from buffer, strategy NOT touched.
+        // Buffer >= amount → withdraw served from buffer; vault balance NOT touched but principal
+        // accounting is written down via relinquishPrincipal so the invariant holds.
         _seedBuffer(60e6);
-        uint256 strategyPrincipalBefore = strategy.principalOf(address(usdc), address(staker));
         uint256 strategyBalBefore = usdc.balanceOf(address(strategy));
         uint256 aliceBalBefore = usdc.balanceOf(alice);
 
@@ -250,12 +250,14 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(usdc.balanceOf(alice), aliceBalBefore + 50e6);
         // Buffer drained by exactly amount.
         assertEq(usdc.balanceOf(address(staker)), 60e6 - 50e6);
-        // Strategy state untouched: no withdraw call hit it.
-        assertEq(strategy.principalOf(address(usdc), address(staker)), strategyPrincipalBefore);
+        // Vault token balance untouched (no vault withdraw call).
         assertEq(usdc.balanceOf(address(strategy)), strategyBalBefore);
         // Internal accounting still decremented.
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 50e6);
+        // Invariant: strategy principal == staker totalStaked after buffer withdrawal.
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(strategy.principalOf(address(usdc), address(staker)), totalStaked);
     }
 
     function test_withdraw_underwater_bufferShort_revertsAndBufferUnchanged() public {
@@ -318,6 +320,65 @@ contract YieldStrategyIntegrationTest is Test {
         // Internal accounting reflects the two successful withdrawals only.
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 200e6 - 60e6);
+    }
+
+    /// @dev Multiple sequential buffer withdrawals: after each one the invariant
+    ///      `strategy.principalOf(token, staker) == poolInfo.totalStaked` must hold.
+    ///      On vault recovery the relinquished principal must NOT re-inflate the staker's
+    ///      redemption amount (vault shares are unchanged; only accounting was corrected).
+    function test_bufferWithdraw_multipleSequential_principalInvariantHoldsAfterEach_noInflationOnRecovery() public {
+        _setStrategy();
+        _stake(alice, 200e6);
+        strategy.setValueFactorBps(9_000); // push underwater
+
+        // Fund a generous buffer: 3 × 40e6 = 120e6.
+        _seedBuffer(120e6);
+
+        // --- First buffer withdrawal ---
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 40e6);
+        {
+            (,,, uint256 ts) = staker.poolInfo(address(usdc));
+            assertEq(strategy.principalOf(address(usdc), address(staker)), ts, "invariant after 1st buffer withdraw");
+            assertEq(ts, 160e6);
+        }
+
+        // --- Second buffer withdrawal ---
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 40e6);
+        {
+            (,,, uint256 ts) = staker.poolInfo(address(usdc));
+            assertEq(strategy.principalOf(address(usdc), address(staker)), ts, "invariant after 2nd buffer withdraw");
+            assertEq(ts, 120e6);
+        }
+
+        // --- Third buffer withdrawal ---
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 40e6);
+        {
+            (,,, uint256 ts) = staker.poolInfo(address(usdc));
+            assertEq(strategy.principalOf(address(usdc), address(staker)), ts, "invariant after 3rd buffer withdraw");
+            assertEq(ts, 80e6);
+        }
+
+        // --- Vault recovery: no principal inflation ---
+        // The strategy's vault balance is 200e6 * 0.9 = 180e6 — we did NOT touch it during buffer
+        // withdrawals, only principal accounting.  On recovery the staker's remaining principal is
+        // 80e6 and the strategy holds 180e6.  A healthy withdraw of 80e6 must return exactly 80e6
+        // (the user is NOT credited the dormant 120e6 worth of now-orphaned shares that were
+        // relinquished — those are protocol-owned surplus, not user principal).
+        strategy.setValueFactorBps(10_000); // recover to par
+        assertFalse(staker.withdrawDisabled(address(usdc)));
+
+        uint256 aliceBalBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        staker.withdraw(address(usdc), 80e6);
+
+        // Alice receives exactly her remaining principal — not inflated by relinquished units.
+        assertEq(usdc.balanceOf(alice), aliceBalBefore + 80e6);
+        (,,, uint256 tsAfter) = staker.poolInfo(address(usdc));
+        assertEq(tsAfter, 0);
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
     }
 
     function test_withdraw_healthy_withBufferPresent_routesThroughStrategy_bufferPreserved() public {
