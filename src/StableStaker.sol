@@ -629,6 +629,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
 
         uint256 received = _pullToken(token, msg.sender, amount);
         uint256 credited = _routeDeposit(token, received);
+        require(credited > 0, "StableStaker: nothing credited");
         info.amount += credited;
         pool.totalStaked += credited;
         info.rewardDebt = (info.amount * pool.accPhusdPerShare) / ACC_PRECISION;
