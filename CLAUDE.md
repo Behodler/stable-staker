@@ -57,9 +57,7 @@ the strategy; `batchMigrate` / `userMigrate` thereafter pay from the realized id
 2. **On the staker** (owner): `staker.setYieldStrategy(token, strategy)`. This `forceApprove`s the
    strategy for unlimited `token`, **sweeps any idle balance** already in the contract into the new
    strategy, and emits `YieldStrategySet`. Clearing or replacing a strategy resets the *old*
-   strategy's allowance to 0. Replacing an in-use strategy does **not** auto-migrate funds out of
-   the old one — drain it first (via the old strategy's owner flow) or replace only while
-   `totalStaked == 0`.
+   strategy's allowance to 0. **`setYieldStrategy` reverts (`"StableStaker: pool not empty"`) unless `totalStaked == 0`** — strategy (un)wiring is an empty-pool-only operation. To change strategy on a live pool, drain it to empty via the terminal migration runbook (`initiateMigration → batchMigrate/userMigrate → finalizeAndReset`) and then wire the fresh strategy on the revived empty pool.
 
 The farm pools all users under a single strategy client account (`recipient = address(this)` for
 both deposit and withdraw); it forwards the redeemed tokens to the real user afterward. Exits

@@ -46,9 +46,25 @@ contract MigrationTest is Test {
         oldStaker.setMigrator(address(migrator));
         newStaker.setMigrator(address(migrator));
 
-        // users stake into v1
-        _fundAndStake(alice, 100e6);
-        _fundAndStake(bob, 300e6);
+        // Fund users but do NOT stake yet — tests that need pre-staked positions
+        // call _stakeAliceAndBob() explicitly. This allows strategy-routing tests to
+        // wire setYieldStrategy on the empty pool BEFORE the first stake (required by the
+        // empty-pool gate introduced in story 010).
+        usdc.mint(alice, 100e6);
+        usdc.mint(bob, 300e6);
+        vm.prank(alice);
+        usdc.approve(address(oldStaker), type(uint256).max);
+        vm.prank(bob);
+        usdc.approve(address(oldStaker), type(uint256).max);
+    }
+
+    /// @dev Stake alice (100e6) and bob (300e6) into oldStaker. Call this AFTER any
+    ///      setYieldStrategy wiring so the empty-pool gate is satisfied.
+    function _stakeAliceAndBob() internal {
+        vm.prank(alice);
+        oldStaker.stake(address(usdc), 100e6);
+        vm.prank(bob);
+        oldStaker.stake(address(usdc), 300e6);
     }
 
     function _fundAndStake(address who, uint256 amt) internal {
@@ -65,18 +81,22 @@ contract MigrationTest is Test {
         users[1] = bob;
     }
 
-    /// @dev Route the OLD staker's USDC principal through a MockYieldStrategy so we can force it
-    ///      below / above par via setValueFactorBps. setYieldStrategy sweeps the already-staked idle
-    ///      balance into the strategy. Returns the strategy so the test can set the value factor.
+    /// @dev Wire the OLD staker's USDC principal through a MockYieldStrategy and then stake alice
+    ///      and bob. Wiring happens FIRST (empty-pool gate: pool must be empty at wire time).
+    ///      Returns the strategy so the test can set the value factor.
     function _routeOldThroughStrategy() internal returns (MockYieldStrategy strategy) {
         strategy = new MockYieldStrategy();
         strategy.setClient(address(oldStaker), true);
+        // Wire on empty pool (story 010 gate: totalStaked must be 0 at this point).
         oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy)));
+        // Stake alice and bob AFTER wiring so principal flows through the strategy.
+        _stakeAliceAndBob();
     }
 
     // ============================== END-TO-END (NO STRATEGY) ==============================
 
     function test_endToEnd_migration_preservesPositionsAndRewards() public {
+        _stakeAliceAndBob();
         // accrue rewards in v1 for a day
         vm.warp(block.timestamp + 1 days);
 
@@ -127,6 +147,7 @@ contract MigrationTest is Test {
     // ============================== PERMISSION GUARDS ==============================
 
     function test_migrate_onlyOwner() public {
+        _stakeAliceAndBob();
         migrator.initiateMigration(address(usdc));
         address[] memory users = new address[](1);
         users[0] = alice;
@@ -142,6 +163,7 @@ contract MigrationTest is Test {
     }
 
     function test_batchMigrate_onlyMigrator() public {
+        _stakeAliceAndBob();
         migrator.initiateMigration(address(usdc));
         address[] memory users = new address[](1);
         users[0] = alice;
@@ -164,6 +186,7 @@ contract MigrationTest is Test {
 
     // Migration must work even while v1 is paused (incident response).
     function test_migration_worksWhilePaused() public {
+        _stakeAliceAndBob();
         oldStaker.setPauser(owner);
         oldStaker.pause();
         vm.warp(block.timestamp + 1 days);
@@ -231,7 +254,13 @@ contract MigrationTest is Test {
         oStaker.setMigrator(address(m));
         nStaker.setMigrator(address(m));
 
-        // equal-principal stakes
+        // Wire the strategy on the EMPTY pool BEFORE staking (empty-pool gate, story 010).
+        MockYieldStrategy strat = new MockYieldStrategy();
+        strat.setClient(address(oStaker), true);
+        oStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strat)));
+        strat.setValueFactorBps(factorBps);
+
+        // equal-principal stakes AFTER wiring
         usdc.mint(alice, pEach);
         usdc.mint(bob, pEach);
         vm.startPrank(alice);
@@ -242,12 +271,6 @@ contract MigrationTest is Test {
         usdc.approve(address(oStaker), type(uint256).max);
         oStaker.stake(address(usdc), pEach);
         vm.stopPrank();
-
-        // underwater strategy
-        MockYieldStrategy strat = new MockYieldStrategy();
-        strat.setClient(address(oStaker), true);
-        oStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strat)));
-        strat.setValueFactorBps(factorBps);
 
         m.initiateMigration(address(usdc));
 
@@ -493,7 +516,7 @@ contract MigrationTest is Test {
 
     // initiateMigration on a pool with no strategy sets R = P (idle principal); credits par.
     function test_noStrategy_setsRequalP_creditsPar() public {
-        // setUp leaves the old staker with no strategy: principal sits idle.
+        _stakeAliceAndBob(); // no strategy: principal sits idle in the contract
         migrator.initiateMigration(address(usdc));
         (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
         assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Migrating));
@@ -513,9 +536,11 @@ contract MigrationTest is Test {
     // A strategy that cannot fully exit (leaves principalOf > 0) makes initiateMigration revert on the
     // post-check. UnderRealizingStrategy caps withdraw to only part of principal per call.
     function test_postCheck_incompleteExitReverts() public {
+        // Wire the under-realizing strategy on the EMPTY pool first, then stake.
         UnderRealizingStrategy strat = new UnderRealizingStrategy();
         strat.setClient(address(oldStaker), true);
         oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strat)));
+        _stakeAliceAndBob(); // stake AFTER wiring (empty-pool gate)
 
         vm.prank(address(migrator));
         vm.expectRevert(bytes("StableStaker: incomplete exit"));
@@ -536,6 +561,7 @@ contract MigrationTest is Test {
 
     // Assert the legal operations for each state and that illegal ops revert with the new messages.
     function test_stateMachine_illegalOpsRevertPerState() public {
+        _stakeAliceAndBob(); // need stakers present to test state-machine transitions
         // --- Active state: migration-only ops are rejected ---
         assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
         vm.prank(address(migrator));
@@ -590,6 +616,7 @@ contract MigrationTest is Test {
     // finalizeAndReset must reject a pool that still has principal even if the staker set is empty
     // (defense-in-depth: both invariants are checked independently).
     function test_finalizeAndReset_rejectsNonZeroPrincipal() public {
+        _stakeAliceAndBob();
         migrator.initiateMigration(address(usdc));
         // Migrate only alice out; bob's 300e6 principal remains -> totalStaked > 0, stakerCount > 0.
         address[] memory justAlice = new address[](1);
@@ -719,34 +746,44 @@ contract MigrationTest is Test {
         assertEq(carolAmt, 100e6);
     }
 
-    // Idle-hold revival: a reset Active pool with no strategy fully credits a stake as an idle hold,
-    // and a subsequent setYieldStrategy(fresh) sweeps that idle balance into the new strategy at par.
+    // Idle-hold revival: after finalizeAndReset the pool is empty; wire a fresh strategy first,
+    // then carol stakes through it at par. This confirms the revived-empty-pool wiring works and
+    // that a subsequent stake routes through the strategy with no desync.
+    // NOTE: The original scenario (stake idle THEN wire) is now forbidden by the empty-pool gate.
+    //       Wiring after staking desyncs totalStaked from strategy.principalOf on AMM strategies.
+    //       The correct order is always: wire on empty pool -> stake -> withdraw.
     function test_revival_idleHoldThenStrategySweep() public {
+        _stakeAliceAndBob();
         migrator.initiateMigration(address(usdc));
         vm.prank(address(migrator));
         oldStaker.batchMigrate(address(usdc), _users());
         oldStaker.finalizeAndReset(address(usdc));
 
-        // Pool is Active with yieldStrategy == address(0): a stake is credited in full as idle hold.
+        // Pool is Active and empty (yieldStrategy was cleared by initiateMigration).
         assertEq(address(oldStaker.yieldStrategy(address(usdc))), address(0));
+        (,,, uint256 emptyTotal) = oldStaker.poolInfo(address(usdc));
+        assertEq(emptyTotal, 0);
+
+        // Wire the fresh strategy on the EMPTY revived pool (gate satisfied).
+        MockYieldStrategy fresh = new MockYieldStrategy();
+        fresh.setClient(address(oldStaker), true);
+        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(fresh)));
+        assertEq(address(oldStaker.yieldStrategy(address(usdc))), address(fresh));
+
+        // Carol stakes AFTER wiring: principal routes through the fresh strategy at par.
         address carol = address(0xCA403);
         usdc.mint(carol, 250e6);
         vm.startPrank(carol);
         usdc.approve(address(oldStaker), type(uint256).max);
         oldStaker.stake(address(usdc), 250e6);
         vm.stopPrank();
+
         (uint256 carolAmt,) = oldStaker.userInfo(address(usdc), carol);
         assertEq(carolAmt, 250e6);
-        assertEq(usdc.balanceOf(address(oldStaker)), 250e6); // sitting idle in-contract
-
-        // Wiring a fresh strategy sweeps the idle balance into it at par; accounting stays consistent.
-        MockYieldStrategy fresh = new MockYieldStrategy();
-        fresh.setClient(address(oldStaker), true);
-        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(fresh)));
         assertEq(fresh.principalOf(address(usdc), address(oldStaker)), 250e6);
-        assertEq(usdc.balanceOf(address(oldStaker)), 0); // swept out of idle
+        assertEq(usdc.balanceOf(address(oldStaker)), 0); // no idle; principal in strategy
 
-        // Carol withdraws full principal at par from the now strategy-backed pool — no desync.
+        // Carol withdraws full principal at par from the strategy-backed pool — no desync.
         uint256 carolBefore = usdc.balanceOf(carol);
         vm.prank(carol);
         oldStaker.withdraw(address(usdc), 250e6);

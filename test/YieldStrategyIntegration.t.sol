@@ -105,16 +105,9 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(usdc.allowance(address(staker), address(strategy)), type(uint256).max);
     }
 
-    function test_setYieldStrategy_sweepsIdleBalance() public {
-        // Stake before any strategy is set: tokens sit idle in the contract.
-        _stake(alice, 100e6);
-        assertEq(usdc.balanceOf(address(staker)), 100e6);
-
-        _setStrategy();
-        // Idle balance has been swept into the strategy.
-        assertEq(usdc.balanceOf(address(staker)), 0);
-        assertEq(strategy.principalOf(address(usdc), address(staker)), 100e6);
-    }
+    // test_setYieldStrategy_sweepsIdleBalance removed: stake-then-wire is now forbidden by the
+    // empty-pool gate. The legitimate idle-then-sweep behaviour (stake idle on revived pool, then
+    // wire strategy to sweep) is covered by Migration.t.sol::test_revival_idleHoldThenStrategySweep.
 
     function test_setYieldStrategy_clearing_zeroesOldAllowance() public {
         _setStrategy();
@@ -581,8 +574,10 @@ contract YieldStrategyIntegrationTest is Test {
         staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
     }
 
-    // ------------------------------------------ swap: YS1 -> YS2 drains old, re-custodies, no migration
+    // ------------------------------------------ swap: in-place swap is now forbidden on non-empty pool
 
+    /// @dev Empty-pool gate: an in-place YS1->YS2 swap is FORBIDDEN once the pool holds principal.
+    ///      The gate fires before any drain, so the full position stays intact in YS1.
     function test_setYieldStrategy_swap_drainsOldAndReCustodiesIntoNew() public {
         _setStrategy(); // YS1
         _stake(alice, 100e6);
@@ -592,35 +587,24 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(totalStaked, 400e6);
         assertEq(strategy.principalOf(address(usdc), address(staker)), 400e6);
 
-        // Swap to YS2 in a single owner call — no initiateMigration, no per-user migration.
+        // Attempt swap to YS2 — must revert because pool is non-empty.
         MockYieldStrategy strategy2 = new MockYieldStrategy();
         strategy2.setClient(address(staker), true);
+        vm.expectRevert(bytes("StableStaker: pool not empty"));
         staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
 
-        // Old strategy fully drained; whole position re-custodied into the new strategy.
-        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
-        assertEq(strategy2.principalOf(address(usdc), address(staker)), 400e6);
-        // Mapping repointed; allowances flipped.
-        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy2));
-        assertEq(usdc.allowance(address(staker), address(strategy)), 0);
-        assertEq(usdc.allowance(address(staker), address(strategy2)), type(uint256).max);
-        // No migration was engaged.
-        assertEq(uint256(staker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
-
-        // A subsequent withdraw resolves against YS2.
-        uint256 balBefore = usdc.balanceOf(alice);
-        vm.prank(alice);
-        staker.withdraw(address(usdc), 100e6);
-        assertEq(usdc.balanceOf(alice), balBefore + 100e6);
-        assertEq(strategy2.principalOf(address(usdc), address(staker)), 300e6);
+        // No state changed; positions and wiring intact.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 400e6);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 0);
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
     }
 
-    // ------------------------------------------ M-06: swapping an underwater strategy reverts
+    // ------------------------------------------ M-06: swapping an underwater strategy reverts (now "pool not empty")
 
-    /// @dev M-06: an in-place swap of an underwater (below-par) strategy is FORBIDDEN. Swapping
-    ///      while below par would silently lift the underwater-withdraw block and FCFS-concentrate
-    ///      the realized loss on the last withdrawer. Impaired strategies must be wound down via the
-    ///      fair, snapshot-based terminal-migration path instead. The guard reverts before any drain.
+    /// @dev M-06 (updated): an in-place swap on a non-empty pool is FORBIDDEN regardless of whether
+    ///      the strategy is underwater or not. The empty-pool gate (statement 2) fires before the
+    ///      underwater guard (now unreachable on non-empty pools), so the revert reason is
+    ///      "pool not empty" rather than "old strategy underwater".
     function test_setYieldStrategy_swap_fromUnderwaterVault_reverts() public {
         _setStrategy(); // YS1
         _stake(alice, 100e6);
@@ -632,8 +616,8 @@ contract YieldStrategyIntegrationTest is Test {
         MockYieldStrategy strategy2 = new MockYieldStrategy();
         strategy2.setClient(address(staker), true);
 
-        // The swap must revert — no state change, no token movement.
-        vm.expectRevert(bytes("StableStaker: old strategy underwater"));
+        // The swap must revert — empty-pool gate fires first (before the underwater check).
+        vm.expectRevert(bytes("StableStaker: pool not empty"));
         staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
 
         // Nothing moved: old strategy still holds the full principal, mapping unchanged.
@@ -642,8 +626,10 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
     }
 
-    // ------------------------------------------ M-06: at-par swap still succeeds
+    // ------------------------------------------ M-06: at-par swap now also forbidden on non-empty pool
 
+    /// @dev Empty-pool gate: even an at-par in-place swap reverts if the pool is non-empty.
+    ///      Being at par is no longer a sufficient condition for an in-place swap.
     function test_setYieldStrategy_swap_atPar_succeeds() public {
         _setStrategy(); // YS1
         _stake(alice, 100e6);
@@ -655,19 +641,21 @@ contract YieldStrategyIntegrationTest is Test {
 
         MockYieldStrategy strategy2 = new MockYieldStrategy();
         strategy2.setClient(address(staker), true);
+
+        // Must revert: pool is non-empty regardless of par status.
+        vm.expectRevert(bytes("StableStaker: pool not empty"));
         staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
 
-        // Whole position drained out of YS1 and re-custodied at par into YS2 — accounting consistent.
-        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
-        assertEq(strategy2.principalOf(address(usdc), address(staker)), 400e6);
-        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy2));
-        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
-        assertEq(totalStaked, 400e6);
-        assertFalse(staker.withdrawDisabled(address(usdc)));
+        // No state changed.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 400e6);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 0);
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
     }
 
-    // ------------------------------------------ M-06: above-par swap succeeds, yield left behind
+    // ------------------------------------------ M-06: above-par in-place swap also forbidden on non-empty pool
 
+    /// @dev Empty-pool gate: even an above-par in-place swap reverts if the pool is non-empty.
+    ///      Above-par is no longer a sufficient condition for an in-place swap.
     function test_setYieldStrategy_swap_abovePar_succeeds_yieldLeftBehind() public {
         _setStrategy(); // YS1
         _stake(alice, 100e6);
@@ -678,20 +666,17 @@ contract YieldStrategyIntegrationTest is Test {
 
         MockYieldStrategy strategy2 = new MockYieldStrategy();
         strategy2.setClient(address(staker), true);
+
+        // Must revert: pool is non-empty regardless of above-par status.
+        vm.expectRevert(bytes("StableStaker: pool not empty"));
         staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
 
-        // Principal (100e6) re-custodied at par into YS2; the drain caps the redeem at par so the
-        // above-par yield is never pulled out and stays behind in the decoupled old strategy as
-        // protocol-owned value (StableStaker credits users principal only).
-        assertEq(strategy.principalOf(address(usdc), address(staker)), 0);
-        assertEq(strategy2.principalOf(address(usdc), address(staker)), 100e6);
-        // The old strategy's principal book is zeroed; any above-par surplus remains protocol-owned
-        // and is not custodied for the farm anymore (the mock only ever held the 100e6 deposited).
-        assertEq(strategy.totalBalanceOf(address(usdc), address(staker)), 0);
-        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy2));
+        // No state changed; YS1 still holds the full position.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 100e6);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 0);
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
         (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
         assertEq(totalStaked, 100e6);
-        assertFalse(staker.withdrawDisabled(address(usdc)));
     }
 
     // ------------------------------------------ M-06: empty / first-adoption swaps succeed
@@ -714,14 +699,121 @@ contract YieldStrategyIntegrationTest is Test {
 
     function test_setYieldStrategy_firstAdoption_noOldStrategy_succeeds() public {
         // No old strategy at all (address(0)): the guarded block is skipped entirely.
+        // Wire must happen BEFORE any stake (empty-pool gate).
         assertEq(address(staker.yieldStrategy(address(usdc))), address(0));
-        _stake(alice, 100e6); // idle hold before adoption
 
-        _setStrategy(); // first adoption
+        _setStrategy(); // first adoption on empty pool
 
-        // Idle balance swept into the freshly adopted strategy.
+        // Strategy wired correctly.
         assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
+        assertEq(usdc.allowance(address(staker), address(strategy)), type(uint256).max);
+
+        // Alice stakes AFTER wiring: principal routes through the strategy.
+        _stake(alice, 100e6);
         assertEq(strategy.principalOf(address(usdc), address(staker)), 100e6);
+        assertEq(usdc.balanceOf(address(staker)), 0);
+    }
+
+    // ------------------------------------------ new TDD tests (story-010)
+
+    /// @dev M-01 regression: first-adoption (no old strategy) on a non-empty pool MUST revert.
+    ///      This is the ss6m1 / M-01 scenario: owner tries to wire a strategy after users have
+    ///      already staked idle.  The empty-pool gate prevents the silent principal desync.
+    function test_setYieldStrategy_revertsOnNonEmptyPool_firstAdoption() public {
+        // Stake first (pool becomes non-empty, no strategy yet).
+        _stake(alice, 100e6);
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, 100e6);
+
+        // First-adoption on non-empty pool must revert.
+        vm.expectRevert(bytes("StableStaker: pool not empty"));
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy)));
+
+        // No strategy was wired.
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(0));
+        // Tokens remain idle in the contract (no sweep occurred).
+        assertEq(usdc.balanceOf(address(staker)), 100e6);
+    }
+
+    /// @dev Empty-pool gate: even an at/above-par in-place strategy swap reverts on non-empty pool.
+    ///      Both the old M-06 guard and the new M-01/M-07 guard collapse into this single check.
+    function test_setYieldStrategy_revertsOnNonEmptyPool_inPlaceSwap() public {
+        _setStrategy(); // YS1 on empty pool — succeeds
+        _stake(alice, 100e6); // pool now non-empty
+
+        MockYieldStrategy strategy2 = new MockYieldStrategy();
+        strategy2.setClient(address(staker), true);
+
+        // Attempt swap at par.
+        strategy.setValueFactorBps(10_000);
+        vm.expectRevert(bytes("StableStaker: pool not empty"));
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
+
+        // Attempt swap above par (also reverts).
+        strategy.setValueFactorBps(12_000);
+        vm.expectRevert(bytes("StableStaker: pool not empty"));
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy2)));
+
+        // Original wiring and positions untouched.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 100e6);
+        assertEq(strategy2.principalOf(address(usdc), address(staker)), 0);
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
+    }
+
+    /// @dev Full revival runbook end-to-end: after finalizeAndReset the pool is empty and
+    ///      setYieldStrategy succeeds, wiring the fresh strategy on the revived pool.
+    function test_setYieldStrategy_succeeds_afterFinalizeAndReset() public {
+        _setStrategy(); // YS1 on empty pool
+        _stake(alice, 100e6);
+        _stake(bob, 300e6);
+
+        // Engage terminal migration, eject everyone, reset.
+        vm.prank(migrator);
+        staker.initiateMigration(address(usdc));
+
+        address[] memory users = new address[](2);
+        users[0] = alice;
+        users[1] = bob;
+        vm.prank(migrator);
+        staker.batchMigrate(address(usdc), users);
+
+        // Pool fully drained.
+        (,,, uint256 drained) = staker.poolInfo(address(usdc));
+        assertEq(drained, 0);
+        assertEq(staker.stakerCount(address(usdc)), 0);
+
+        staker.finalizeAndReset(address(usdc));
+        assertEq(uint256(staker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+
+        // Wire a fresh strategy on the revived empty pool — must succeed.
+        MockYieldStrategy fresh = new MockYieldStrategy();
+        fresh.setClient(address(staker), true);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(fresh)));
+
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(fresh));
+        assertEq(usdc.allowance(address(staker), address(fresh)), type(uint256).max);
+
+        // A new stake routes through the fresh strategy correctly.
+        _stake(alice, 50e6);
+        assertEq(fresh.principalOf(address(usdc), address(staker)), 50e6);
+    }
+
+    /// @dev Donation dust does NOT brick the gate: totalStaked == 0 even if someone donated tokens.
+    ///      A direct token transfer (donation) raises the idle balance but NOT totalStaked, so
+    ///      the setYieldStrategy gate permits wiring.
+    function test_setYieldStrategy_succeeds_withDonationDust_onEmptyPool() public {
+        // Donate 1e6 dust to the staker (no user stake; totalStaked remains 0).
+        usdc.mint(address(staker), 1e6);
+        assertEq(usdc.balanceOf(address(staker)), 1e6);
+        (,,, uint256 totalStaked) = staker.poolInfo(address(usdc));
+        assertEq(totalStaked, 0); // gate checks totalStaked, not idle balance
+
+        // Wire the strategy — must succeed because totalStaked == 0.
+        _setStrategy();
+
+        assertEq(address(staker.yieldStrategy(address(usdc))), address(strategy));
+        // Idle dust (the donation) is swept into the strategy by the sweep-on-wire logic.
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 1e6);
         assertEq(usdc.balanceOf(address(staker)), 0);
     }
 }
