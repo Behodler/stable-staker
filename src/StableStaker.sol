@@ -218,6 +218,14 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      */
     function setYieldStrategy(address token, IYieldStrategy strategy) external onlyOwner poolExists(token) {
         require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
+        // Strategy (un)wiring is an EMPTY-POOL-only operation. Once a pool holds staked principal,
+        // moving that principal in place desyncs `totalStaked` from `strategy.principalOf` whenever
+        // the deposit/exit haircuts (market/AMM strategies). That is the shared root cause of
+        // ss6m1/M-01 (first-adoption sweep), M-06 (underwater swap) and M-07 (AMM-execution swap):
+        // no guard compares `totalStaked` against strategy principal, so the desync is silent.
+        // Principal may only move through the realize-once-and-socialize terminal-migration path:
+        //   initiateMigration -> batchMigrate/userMigrate -> finalizeAndReset (pool now empty) -> setYieldStrategy
+        require(poolInfo[token].totalStaked == 0, "StableStaker: pool not empty");
 
         IYieldStrategy old = yieldStrategy[token];
         if (address(old) != address(0)) {
