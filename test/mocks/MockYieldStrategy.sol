@@ -153,4 +153,10 @@ contract MockYieldStrategy is IYieldStrategy {
     function setAsideBufferSize(address) external pure override returns (uint256) {
         return 0;
     }
+
+    function setSetAsideBufferRecipient(address) external override {}
+
+    function setAsideBufferRecipient() external pure override returns (address) {
+        return address(0);
+    }
 }
