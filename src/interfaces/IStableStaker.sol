@@ -40,4 +40,17 @@ interface IStableStaker {
      * @param amount The principal to deposit on the user's behalf.
      */
     function depositFor(address token, address user, uint256 amount) external;
+
+    /**
+     * @notice Read-only auto-getter for the staker's public `userInfo` mapping. Returns `user`'s
+     *         currently-credited position for `token`. Used by the migrator to snapshot the credited
+     *         principal before/after a {depositFor} so it can compute and fund a re-injection top-up.
+     * @dev Interface-only declaration matching the StableStaker public mapping's auto-getter; this is
+     *      NOT a change to StableStaker.sol.
+     * @param token The staked token.
+     * @param user  The user whose position to read.
+     * @return amount     The user's credited principal.
+     * @return rewardDebt The user's reward-debt bookkeeping value.
+     */
+    function userInfo(address token, address user) external view returns (uint256 amount, uint256 rewardDebt);
 }

@@ -416,6 +416,193 @@ contract InPlaceMigratorTest is Test {
         vm.expectRevert(bytes("InPlaceMigrator: nothing parked"));
         migrator.claimTimedOut(address(usdc));
     }
+
+    // ============================== M-01 TOP-UP HELPERS ==============================
+
+    /// @notice Drive the OUT leg (par, no strategy), then rewire the empty pool to a fresh slippage
+    ///         strategy `v2` with `slippageBps` deposit haircut. Returns the wired strategy.
+    function _outAndRewireWithSlippage(uint256 slippageBps) internal returns (MockYieldStrategy v2) {
+        _stakeAliceAndBob();
+        migrator.initiateMigration(address(usdc));
+        migrator.migrateOut(address(usdc), _users());
+
+        staker.finalizeAndReset(address(usdc));
+        v2 = new MockYieldStrategy();
+        v2.setClient(address(staker), true);
+        v2.setDepositSlippageBps(slippageBps);
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(v2)));
+    }
+
+    // ============== TEST 11: M-01 PoC flips to whole when surplus funded ==============
+
+    function test_m01_topupRestoresToParWithSurplus() public {
+        // 1% deposit haircut on the re-injection strategy.
+        _outAndRewireWithSlippage(100);
+
+        // Owner funds the implicit top-up budget by sending surplus to the migrator BEFORE migrateIn.
+        // Parked principal is 400e6; send 10e6 surplus (well above the ~1% slippage on 400e6).
+        usdc.mint(address(migrator), 10e6);
+
+        uint256 surplusBefore = usdc.balanceOf(address(migrator)) - migrator.totalParked(address(usdc));
+        assertEq(surplusBefore, 10e6);
+
+        migrator.migrateIn(address(usdc), 0, migrator.parkedUserCount(address(usdc)));
+
+        // Re-injected stakers land at par (within amt/1000): WITHOUT the fix they'd be ~1% short.
+        (uint256 aNew,) = staker.userInfo(address(usdc), alice);
+        (uint256 bNew,) = staker.userInfo(address(usdc), bob);
+        assertGe(aNew, 100e6 - 100e6 / 1000);
+        assertGe(bNew, 300e6 - 300e6 / 1000);
+        // And essentially exactly at par (a few wei of integer-division dust at most).
+        assertApproxEqAbs(aNew, 100e6, 10);
+        assertApproxEqAbs(bNew, 300e6, 10);
+
+        // Custody parked state fully cleared.
+        assertEq(migrator.totalParked(address(usdc)), 0);
+        assertEq(migrator.parkedUserCount(address(usdc)), 0);
+
+        // Surplus was consumed by the top-ups; whatever's left is still rescuable.
+        uint256 leftover = usdc.balanceOf(address(migrator));
+        assertLt(leftover, surplusBefore); // top-ups spent some surplus
+        uint256 ownerBefore = usdc.balanceOf(owner);
+        migrator.rescueERC20(address(usdc), owner, leftover);
+        assertEq(usdc.balanceOf(owner) - ownerBefore, leftover);
+        assertEq(usdc.balanceOf(address(migrator)), 0);
+    }
+
+    // ============== TEST 12: conservation control at 0 bps haircut ==============
+
+    function test_m01_zeroHaircut_noTopupSurplusUntouched() public {
+        _outAndRewireWithSlippage(0); // par strategy: credited == amt, no top-up path taken.
+
+        // Send surplus; at 0 bps it must remain completely untouched.
+        usdc.mint(address(migrator), 25e6);
+        uint256 surplusBefore = usdc.balanceOf(address(migrator)) - migrator.totalParked(address(usdc));
+        assertEq(surplusBefore, 25e6);
+
+        migrator.migrateIn(address(usdc), 0, migrator.parkedUserCount(address(usdc)));
+
+        // Identical to pre-fix: exact principal re-credited.
+        (uint256 aNew,) = staker.userInfo(address(usdc), alice);
+        (uint256 bNew,) = staker.userInfo(address(usdc), bob);
+        assertEq(aNew, 100e6);
+        assertEq(bNew, 300e6);
+
+        // Surplus untouched: balance == surplus (parked is 0 now).
+        assertEq(usdc.balanceOf(address(migrator)), surplusBefore);
+        assertEq(migrator.totalParked(address(usdc)), 0);
+    }
+
+    // ============== TEST 13: fuzz haircut 1–500 bps lands at par ==============
+
+    function testFuzz_m01_topupLandsAtPar(uint256 slippageBps) public {
+        slippageBps = bound(slippageBps, 1, 500);
+        _outAndRewireWithSlippage(slippageBps);
+
+        // Generously fund the implicit budget (much more than the ~5% worst-case grossed-up shortfall).
+        usdc.mint(address(migrator), 100e6);
+        uint256 surplusBefore = usdc.balanceOf(address(migrator)) - migrator.totalParked(address(usdc));
+
+        migrator.migrateIn(address(usdc), 0, migrator.parkedUserCount(address(usdc)));
+
+        (uint256 aNew,) = staker.userInfo(address(usdc), alice);
+        (uint256 bNew,) = staker.userInfo(address(usdc), bob);
+
+        // Every user lands at par within amt/1000.
+        assertGe(aNew, 100e6 - 100e6 / 1000);
+        assertGe(bNew, 300e6 - 300e6 / 1000);
+
+        // Surplus consumed matches the gross-up: spent == surplus drop, and the credited principal now
+        // sitting in the strategy equals roughly the parked total (par restoration).
+        uint256 surplusAfter = usdc.balanceOf(address(migrator)) - migrator.totalParked(address(usdc));
+        uint256 spent = surplusBefore - surplusAfter;
+        // Spend is positive (a haircut existed) and bounded by the gross-up budget for 400e6 @ <=5%.
+        assertGt(spent, 0);
+        assertLe(spent, 100e6);
+    }
+
+    // ============== TEST 14: insufficient surplus reverts whole batch, state intact ==============
+
+    function test_m01_insufficientSurplusRevertsBatch() public {
+        _outAndRewireWithSlippage(100); // 1% haircut needs ~4e6 surplus across 400e6 parked.
+
+        // Snapshot pre-migrateIn state.
+        uint256 parkedAliceBefore = migrator.parked(address(usdc), alice);
+        uint256 parkedBobBefore = migrator.parked(address(usdc), bob);
+        uint256 totalParkedBefore = migrator.totalParked(address(usdc));
+        uint256 countBefore = migrator.parkedUserCount(address(usdc));
+
+        // No surplus sent -> top-up has zero budget -> batch reverts.
+        uint256 cnt = migrator.parkedUserCount(address(usdc));
+        vm.expectRevert(bytes("InPlaceMigrator: top-up surplus exhausted"));
+        migrator.migrateIn(address(usdc), 0, cnt);
+
+        // All users remain parked and recoverable: no state-mutation leak.
+        assertEq(migrator.parked(address(usdc), alice), parkedAliceBefore);
+        assertEq(migrator.parked(address(usdc), bob), parkedBobBefore);
+        assertEq(migrator.totalParked(address(usdc)), totalParkedBefore);
+        assertEq(migrator.parkedUserCount(address(usdc)), countBefore);
+
+        // The timeout hatch still works for the still-parked users.
+        vm.warp(block.timestamp + TIMEOUT);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        migrator.claimTimedOut(address(usdc));
+        assertEq(usdc.balanceOf(alice) - aliceBefore, 100e6);
+    }
+
+    // ============== TEST 15: rescueERC20 floor + full reclaim after migration ==============
+
+    function test_m01_rescueFloorAndLeftoverReclaim() public {
+        _outAndRewireWithSlippage(100);
+        usdc.mint(address(migrator), 10e6);
+
+        // While users are parked, rescue still cannot dip below totalParked.
+        vm.expectRevert(bytes("InPlaceMigrator: cannot touch parked principal"));
+        migrator.rescueERC20(address(usdc), owner, 10e6 + 1);
+
+        migrator.migrateIn(address(usdc), 0, migrator.parkedUserCount(address(usdc)));
+
+        // After migration totalParked is 0, so the entire leftover balance is the rescuable surplus.
+        uint256 leftover = usdc.balanceOf(address(migrator));
+        assertEq(migrator.totalParked(address(usdc)), 0);
+        uint256 ownerBefore = usdc.balanceOf(owner);
+        migrator.rescueERC20(address(usdc), owner, leftover);
+        assertEq(usdc.balanceOf(owner) - ownerBefore, leftover);
+        assertEq(usdc.balanceOf(address(migrator)), 0);
+    }
+
+    // ============== TEST 16: zero-credit dust user reverts batch (L-01 out of scope) ==============
+
+    function test_m01_zeroCreditDustRevertsBatch() public {
+        // A near-100% haircut makes a tiny first deposit credit 0, so StableStaker.depositFor reverts
+        // ("nothing credited") BEFORE the top-up logic. Documents L-01 as knowingly out of scope.
+        address dust = address(0xD057);
+        usdc.mint(dust, 1); // 1 wei position
+        vm.prank(dust);
+        usdc.approve(address(staker), type(uint256).max);
+
+        vm.prank(dust);
+        staker.stake(address(usdc), 1);
+
+        migrator.initiateMigration(address(usdc));
+        address[] memory one = new address[](1);
+        one[0] = dust;
+        migrator.migrateOut(address(usdc), one);
+        assertEq(migrator.parked(address(usdc), dust), 1);
+
+        staker.finalizeAndReset(address(usdc));
+        MockYieldStrategy v2 = new MockYieldStrategy();
+        v2.setClient(address(staker), true);
+        v2.setDepositSlippageBps(9_999); // 99.99% haircut: 1 wei credits floor(1*1/10000)=0.
+        staker.setYieldStrategy(address(usdc), IYieldStrategy(address(v2)));
+
+        // Even with ample surplus, the FIRST depositFor(1) credits 0 and reverts the batch.
+        usdc.mint(address(migrator), 100e6);
+        uint256 dustCnt = migrator.parkedUserCount(address(usdc));
+        vm.expectRevert(bytes("StableStaker: nothing credited"));
+        migrator.migrateIn(address(usdc), 0, dustCnt);
+    }
 }
 
 // ============================== REENTRANCY HARNESS ==============================

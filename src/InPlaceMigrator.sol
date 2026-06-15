@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./interfaces/IStableStaker.sol";
 
 /**
@@ -103,6 +104,24 @@ contract InPlaceMigrator is Ownable, ReentrancyGuard {
     event TimedOutClaim(address indexed token, address indexed user, uint256 amount);
 
     /**
+     * @notice Emitted per re-injected user in {migrateIn}, recording the migration-slippage top-up.
+     * @param token         The re-injected token.
+     * @param user          The user re-credited.
+     * @param parked        The principal that was parked for the user (the `amt` re-injected).
+     * @param credited      What the FIRST `depositFor(amt)` actually credited (haircut-reduced).
+     * @param topup         The grossed-up surplus-funded top-up deposited to close the shortfall (0 if none).
+     * @param finalCredited The user's total credited principal across both deposits (target == `parked`).
+     */
+    event ReinjectedWithTopup(
+        address indexed token,
+        address indexed user,
+        uint256 parked,
+        uint256 credited,
+        uint256 topup,
+        uint256 finalCredited
+    );
+
+    /**
      * @param _staker          The single live staker to rewire in place (source AND target).
      * @param _migrationTimeout Seconds before `claimTimedOut` opens. Recommended deploy value: 7 days.
      * @param initialOwner     The operator who orchestrates the migration.
@@ -198,9 +217,13 @@ contract InPlaceMigrator is Ownable, ReentrancyGuard {
             total += parked[token][user];
         }
 
-        // (E) Approval scoped to the exact slice total, set immediately before the depositFor loop.
-        if (total > 0) {
-            IERC20(token).forceApprove(address(staker), total);
+        // (E) Approve the migrator's FULL token balance for this token immediately before the loop.
+        // The principal deposits pull `total`; the per-user top-ups pull ADDITIONAL surplus, and the
+        // cumulative top-ups across the batch cannot exceed the surplus (= balance - totalParked).
+        // Approving the whole balance bounds and covers both legs in a single scoped approval that
+        // `forceApprove` overwrites (no dangling allowance).
+        if (IERC20(token).balanceOf(address(this)) > 0) {
+            IERC20(token).forceApprove(address(staker), IERC20(token).balanceOf(address(this)));
         }
 
         uint256 count;
@@ -219,11 +242,55 @@ contract InPlaceMigrator is Ownable, ReentrancyGuard {
             count++;
 
             // (C) The only owner-driven exit for parked principal: back into the immutable staker,
-            // crediting the original user. No other destination is reachable.
-            staker.depositFor(token, user, amt);
+            // crediting the original user. No other destination is reachable. Delegated to a helper
+            // to keep the loop frame shallow (interactions + top-up locals live in the helper).
+            _reinjectWithTopup(token, user, amt);
         }
 
         emit MigratedIn(token, count, total);
+    }
+
+    /**
+     * @notice Re-inject `amt` parked principal for `user` into the staker, then close the
+     *         migration-slippage shortfall with a surplus-funded, grossed-up top-up so the user lands
+     *         at par (within `amt/1000`). Reverts the whole batch if the live surplus can't cover it.
+     * @dev Extracted from {migrateIn}'s loop to keep that frame shallow (avoids stack-too-deep). MUST
+     *      be called only AFTER the caller's CEI effects block has zeroed `parked`/`migrationBegin`,
+     *      decremented `totalParked` by `amt`, and removed the user from the set — the live-surplus
+     *      check relies on `totalParked` already reflecting this user's exit.
+     */
+    function _reinjectWithTopup(address token, address user, uint256 amt) private {
+        // M-01 fix: `depositFor(amt)` credits only the strategy's (haircut-reduced) return, so a
+        // re-injected user would be silently underpaid by the migration slippage. Snapshot the credited
+        // principal around the deposit, then close any shortfall with a surplus-funded top-up grossed
+        // up to survive its OWN haircut, restoring the user to par.
+        (uint256 amountBefore,) = staker.userInfo(token, user);
+        staker.depositFor(token, user, amt); // funded from parked principal (as today)
+        (uint256 amountAfter,) = staker.userInfo(token, user);
+        uint256 credited = amountAfter - amountBefore; // > 0: depositFor reverts on zero credit
+
+        uint256 topup = 0;
+        if (credited < amt) {
+            // Gross-up so the top-up survives its OWN haircut: topup = shortfall * amt / credited.
+            // Math.mulDiv avoids intermediate overflow on `shortfall * amt`.
+            topup = Math.mulDiv(amt - credited, amt, credited);
+            // Implicit budget: surplus held above the remaining parked principal. The caller's effects
+            // block already decremented `totalParked` by `amt`, and the principal `depositFor` pulled
+            // `amt` from balance, so only a top-up (no matching `totalParked` decrement) consumes it.
+            require(
+                topup <= IERC20(token).balanceOf(address(this)) - totalParked[token],
+                "InPlaceMigrator: top-up surplus exhausted"
+            );
+            staker.depositFor(token, user, topup); // funded from migrator surplus balance
+        }
+
+        (uint256 finalAmount,) = staker.userInfo(token, user);
+        uint256 finalCredited = finalAmount - amountBefore;
+        // Non-reverting backstop: the gross-up targets exact par algebraically, so this only ever
+        // forgives the few-wei integer-division residual. It binds only under a pathological ~100%
+        // haircut, where reverting the batch is correct.
+        require(finalCredited >= amt - amt / 1000, "InPlaceMigrator: par not restored");
+        emit ReinjectedWithTopup(token, user, amt, credited, topup, finalCredited);
     }
 
     // ============================== TIMEOUT ESCAPE HATCH ==============================
