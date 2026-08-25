@@ -10,6 +10,7 @@ import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "flax-token/IFlax.sol";
 import "pauser/interfaces/IPausable.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
+import "./interfaces/IStableStaker.sol";
 
 /**
  * @title StableStaker
@@ -38,7 +39,7 @@ import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
  *      address pauses; owner OR pauser unpauses. The {emergencyWithdraw} escape hatch and the
  *      migration hooks intentionally remain callable while paused.
  */
-contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
+contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable, IStableStaker {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
 
@@ -75,7 +76,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
     mapping(address => PoolInfo) public poolInfo;
 
     /// @notice token => user => position.
-    mapping(address => mapping(address => UserInfo)) public userInfo;
+    mapping(address => mapping(address => UserInfo)) public override userInfo;
 
     /// @notice token => enumerable set of addresses currently holding a non-zero position.
     mapping(address => EnumerableSet.AddressSet) private _stakers;
@@ -422,7 +423,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      * @param token The staked token to put into terminal migration. Must be a registered pool and not
      *              already migrating.
      */
-    function initiateMigration(address token) external nonReentrant onlyMigrator poolExists(token) {
+    function initiateMigration(address token) external override nonReentrant onlyMigrator poolExists(token) {
         require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
 
         // Settle rewards to this block; subsequent _updatePool calls are frozen once Migrating is set,
@@ -488,6 +489,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      */
     function batchMigrate(address token, address[] calldata users)
         external
+        override
         nonReentrant
         onlyMigrator
         poolExists(token)
@@ -615,6 +617,7 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable {
      */
     function depositFor(address token, address user, uint256 amount)
         external
+        override
         nonReentrant
         onlyMigrator
         poolExists(token)
