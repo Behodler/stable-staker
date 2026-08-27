@@ -34,5 +34,8 @@ jobs:
       - name: Run Forge build
         run: forge build --sizes
 
+      - name: Golden rule — migration surface intact
+        run: .github/scripts/check-migration-surface.sh
+
       - name: Run Forge tests
         run: forge test -vvv

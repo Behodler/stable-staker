@@ -102,6 +102,61 @@ pool can never resume healthy operation (no resume path), and `stake` / `withdra
 snapshot. The `StableStakerMigrator` exposes an owner-only `initiateMigration` forwarder (call once
 per token before the first `migrate` batch).
 
+## Golden rule — the migration triad is permanent
+
+**EVERY version of `StableStaker`, past, present and future, must expose all three of:**
+
+| Function | Frozen signature | Selector |
+|---|---|---|
+| `initiateMigration` | `initiateMigration(address)` | `0x71726c92` |
+| `batchMigrate` | `batchMigrate(address,address[])` | `0x0ad9aeb9` |
+| `depositFor` | `depositFor(address,address,uint256)` | `0xb3db428b` |
+
+They are declared in `src/interfaces/IStableStakerMigratable.sol` and are the whole of a
+cross-version hop: `initiateMigration` freezes the source pool, `batchMigrate` drains it,
+`depositFor` credits the destination. Every version snapshot under `src/versions/` inherits that
+interface, and `StableStaker` declares `is IStableStaker` (which extends it).
+
+**Why it is permanent.** Remove one — or reshape a signature, which is the same thing at the wire
+level — and the users staked in the deployed V1 instance
+`0xbce8ABC09BaEDCabE93419bF875f6186e182079A` (Ethereum mainnet) are stranded in a contract nothing
+can migrate them out of. Deployed bytecode cannot be patched. There is no recovery, so there is no
+"we'll fix it in the next version".
+
+The `token` first parameter is load-bearing: a `StableStaker` is multi-pool. A future one-pool
+redesign that dropped it would break the golden rule by construction — see the long note in
+`IStableStakerMigratable.sol`.
+
+**If the build complains** that `StableStaker` does not implement one of the three, the fix is to
+RESTORE the function on the contract. Never delete the declaration from the interface or from a
+`src/versions/` snapshot to make the error go away — that is the exact failure the layers below
+exist to catch.
+
+### Four layers of enforcement
+
+1. **The compiler.** `StableStaker is IStableStaker`, so deleting one of the three from the
+   contract fails the build (story 014).
+2. **A `PreToolUse` hook** — `.claude/hooks/protect-migration-surface.sh`, registered in
+   `.claude/settings.json`. Denies an `Edit`/`Write` under `src/` that removes a protected
+   declaration, and denies a `git commit` whose staged tree declares one fewer time than `HEAD`.
+   Fails closed. **Known gap**: a hook only fires when `stable-staker` is the session's project
+   root, and this repo is normally driven as a submodule — see `.claude/hooks/README.md`.
+3. **A CI gate** — `.github/scripts/check-migration-surface.sh`, run on every push. Checks the
+   perpetual interface, the evergreen implementation, and that every `src/versions/` snapshot still
+   reads `is IStableStakerMigratable`. No blind spot about which directory an agent was driven from.
+4. **`test/GoldenRule.t.sol`** — pins the three selectors to hard-coded byte constants, so a
+   coordinated redesign that changes interface and implementation together still fails. Those
+   constants are not a magic number to update when the test goes red; they are the wire format the
+   live instance answers to. `test/GoldenRuleInterface.t.sol` additionally asserts the triad stays
+   `onlyMigrator`-gated and reachable through the interface.
+
+### Overriding the rule
+
+For the day the live V1 instance is genuinely empty and dead: put `GOLDEN-RULE-OVERRIDE` in the
+commit message. The hook allows the commit and prints a loud warning. A rule with no sanctioned
+exit gets worked around destructively — this one has a door, and using it is recorded permanently
+in git history. Using it while V1 still holds stakers is a decision to strand them.
+
 ## Evergreen contract and version snapshots
 
 `src/StableStaker.sol` is **evergreen**: it is the permanently-current implementation and is
