@@ -13,16 +13,22 @@ directly to users on claim / withdraw / migration.
   emission budget, per-token `EnumerableSet` of stakers (`getStakers` / `getStakersRange` /
   `stakerCount`), Behodler3 pausing (`pauser` + `IPausable`), and a permissionless
   `emergencyWithdraw` escape hatch.
-- `src/StableStakerMigrator.sol` — moves a batch of users from one `StableStaker` to another with
-  zero user action, preserving principal and minting earned rewards. Uses the staker's permissioned
-  terminal-migration hooks `initiateMigration` (once per token) + `batchMigrate` / `depositFor`
-  (caller must be the configured `migrator`). See "Terminal migration mode" below.
+- `src/CrossVersionMigrator.sol` — moves a batch of users from one `StableStaker` to another with
+  zero user action, preserving principal and minting earned rewards. Both ends are typed on the
+  narrow golden-rule interface `IStableStakerMigratable` and are `immutable`, so it works across
+  ANY two versions (V1→V2, V2→V3, …) and can never be retargeted by a compromised owner. Uses the
+  staker's permissioned terminal-migration hooks `initiateMigration` (once per token) +
+  `batchMigrate` / `depositFor` (caller must be the configured `migrator`). Zero-credit dust users
+  are skipped rather than reverting the batch, and underwater haircuts are NOT compensated here.
+  Carries an advisory `versionOf` probe that reports a staker with no `STAKER_VERSION` getter as
+  version 1. See "Terminal migration mode" and "The two migrators" below.
 - `src/InPlaceMigrator.sol` — swaps a single staker's yield strategy **in place**, without
   deploying a new `StableStaker`. Drives the same terminal-migration hooks
   (`initiateMigration` → `batchMigrate`/`userMigrate` → `finalizeAndReset`) against one contract
   so an empty pool can be re-wired to a fresh `IYieldStrategy`, with a surplus-funded top-up that
   re-injects the haircut.
-- `src/interfaces/IStableStaker.sol` — minimal interface the migrator depends on.
+- `src/interfaces/IStableStaker.sol` — minimal interface `InPlaceMigrator` depends on (the
+  golden-rule triad plus the `userInfo` getter its top-up needs).
 - `src/interfaces/IStableStakerMigratable.sol` — the perpetual "golden rule" interface
   (`initiateMigration`, `batchMigrate`, `depositFor`) that every version must satisfy.
 - `src/versions/` — frozen, never-edited interface snapshots of each deployed `StableStaker`.
@@ -99,8 +105,46 @@ the idle pile, so payouts are independent of batch composition, ordering, and ba
 Equal principal ⇒ equal payout (closes ss2m1 / M-01). Migration is terminal: once engaged a token's
 pool can never resume healthy operation (no resume path), and `stake` / `withdraw` /
 `emergencyWithdraw` / the old staker's `depositFor` are blocked while `active` to preserve the
-snapshot. The `StableStakerMigrator` exposes an owner-only `initiateMigration` forwarder (call once
+snapshot. The `CrossVersionMigrator` exposes an owner-only `initiateMigration` forwarder (call once
 per token before the first `migrate` batch).
+
+## The two migrators
+
+There are exactly TWO migrators, and the choice between them is the source/target question:
+
+| Contract | Source → target | Use it for |
+|---|---|---|
+| `src/CrossVersionMigrator.sol` | staker A → staker B (different contracts, any versions) | a true replacement deploy, or a version hop |
+| `src/InPlaceMigrator.sol` | staker A → staker A (same contract) | swapping a live pool's `IYieldStrategy`, which `setYieldStrategy`'s empty-pool gate makes impossible in place |
+
+Only `InPlaceMigrator` makes users whole after an underwater exit: its story-013 surplus-funded
+top-up (`_reinjectWithTopup`) re-injects the haircut. `CrossVersionMigrator` deliberately does NOT
+carry that logic — a cross-version migration through an underwater strategy credits the uniform
+snapshot haircut. That asymmetry is a real product difference and wants a human decision before a
+cross-version migration is run on a live, underwater user base.
+
+Both pin their targets as `immutable`: an owner-mutable target is a drain vector, so a new pair of
+stakers always means a NEW migrator deployment plus re-wiring `setMigrator` on both sides.
+
+**A third migrator, `src/StableStakerMigrator.sol`, was REMOVED in story 018.** It was the original
+cross-staker tool and `CrossVersionMigrator` is a strict functional superset of it (same forwarder,
+same `batchMigrate` → sum → `forceApprove` → `depositFor` flow, same zero-credit skip, same
+immutable ends), so keeping both would have left two overlapping tools with no rule for choosing
+between them. No instance of it was ever recorded in
+`reflax-mint/phase-2-staging/server/deployments/mainnet-addresses.ts`, and the one saga that would
+have used it (the temp-staker "ys-swap" saga) was abandoned in favour of the `InPlaceMigrator`
+route. The source is recoverable from git history if a cross-staker-only tool is ever wanted back:
+
+```bash
+git log --all --diff-filter=D -- src/StableStakerMigrator.sol
+git show <commit>^:src/StableStakerMigrator.sol
+```
+
+Known fallout, deliberately left unrepaired and tracked as a cross-repo follow-up: in the sibling
+`reflax-mint/phase-2-staging` repo, `script/DeployTempStableStakerAndMigrators.s.sol` and
+`test/YsSwapMigrationHardening.t.sol` import the deleted contract and no longer compile. Both
+belong to the abandoned saga. `script/SkimAndLeg1Migration.s.sol` and `script/Leg2Migration.s.sol`
+declare their own local interfaces and are unaffected.
 
 ## Golden rule — the migration triad is permanent
 

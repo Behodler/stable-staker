@@ -23,11 +23,12 @@ import "./interfaces/IStableStaker.sol";
  *      `StableStaker.setYieldStrategy(token, strategy)` reverts unless `poolInfo[token].totalStaked
  *      == 0` (empty-pool gate). There is no hot-swap path: to replace a strategy on a live pool you
  *      must drain every staker out, reset the pool, wire the new strategy, then put everyone back.
- *      The existing `StableStakerMigrator` does this by bouncing all users through a throwaway temp
- *      `StableStaker`. This migrator removes the temp staker: it already physically receives the
- *      principal during `batchMigrate` (the staker `safeTransfer`s the aggregate to `msg.sender`),
- *      so instead of forwarding it into a temp staker and pulling it back later, it simply PARKS it
- *      across the reset and re-injects it into the SAME staker once the new strategy is wired.
+ *      A cross-staker migrator (`CrossVersionMigrator`) does this by bouncing all users through a
+ *      throwaway temp `StableStaker`. This migrator removes the temp staker: it already physically
+ *      receives the principal during `batchMigrate` (the staker `safeTransfer`s the aggregate to
+ *      `msg.sender`), so instead of forwarding it into a temp staker and pulling it back later, it
+ *      simply PARKS it across the reset and re-injects it into the SAME staker once the new
+ *      strategy is wired.
  *
  *      (B) CUSTODY IS THE WHOLE POINT — Between `migrateOut` and `migrateIn` the migrator holds raw
  *      principal for every parked user. This is a real, deliberate trust concession during the
@@ -53,8 +54,8 @@ import "./interfaces/IStableStaker.sol";
  *      `batchMigrate`), so the hatch returns PRINCIPAL ONLY.
  *
  *      Scoped for a small staker set, a single batch, and a short window. Not built for long-running,
- *      multi-day, many-batch migrations. The `StableStakerMigrator` remains the tool for the
- *      cross-staker (true replacement) case it was built for; this contract is additive.
+ *      multi-day, many-batch migrations. `CrossVersionMigrator` is the tool for the cross-staker /
+ *      cross-version (true replacement) case; this contract is additive.
  */
 contract InPlaceMigrator is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;

@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/StableStaker.sol";
-import "../src/StableStakerMigrator.sol";
+import "../src/CrossVersionMigrator.sol";
 import "../src/interfaces/IStableStaker.sol";
 import "flax-token/FlaxToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -18,7 +18,7 @@ contract MigrationTest is Test {
     FlaxToken internal phUSD;
     StableStaker internal oldStaker;
     StableStaker internal newStaker;
-    StableStakerMigrator internal migrator;
+    CrossVersionMigrator internal migrator;
     MockERC20 internal usdc;
 
     address internal owner = address(this);
@@ -42,7 +42,9 @@ contract MigrationTest is Test {
         oldStaker.phUSDPerDay(address(usdc), PER_DAY);
         newStaker.phUSDPerDay(address(usdc), PER_DAY);
 
-        migrator = new StableStakerMigrator(IStableStaker(address(oldStaker)), IStableStaker(address(newStaker)), owner);
+        migrator = new CrossVersionMigrator(
+            IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(newStaker)), owner
+        );
         oldStaker.setMigrator(address(migrator));
         newStaker.setMigrator(address(migrator));
 
@@ -249,8 +251,9 @@ contract MigrationTest is Test {
         nStaker.addToken(address(usdc));
         oStaker.phUSDPerDay(address(usdc), PER_DAY);
         nStaker.phUSDPerDay(address(usdc), PER_DAY);
-        StableStakerMigrator m =
-            new StableStakerMigrator(IStableStaker(address(oStaker)), IStableStaker(address(nStaker)), owner);
+        CrossVersionMigrator m = new CrossVersionMigrator(
+            IStableStakerMigratable(address(oStaker)), IStableStakerMigratable(address(nStaker)), owner
+        );
         oStaker.setMigrator(address(m));
         nStaker.setMigrator(address(m));
 

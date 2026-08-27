@@ -10,9 +10,10 @@ import "./IStableStakerMigratable.sol";
  *         (`initiateMigration`, `batchMigrate`, `depositFor`) plus the read-only `userInfo`
  *         auto-getter declared here.
  * @dev Kept intentionally small so the migrators are decoupled from the full staker
- *      implementation. Both {StableStakerMigrator} and {InPlaceMigrator} consume this
- *      interface; `userInfo` exists for the latter, which must snapshot a user's credited
- *      principal around a {depositFor} to compute a re-injection top-up.
+ *      implementation. {InPlaceMigrator} consumes this interface; `userInfo` exists for it,
+ *      because it must snapshot a user's credited principal around a {depositFor} to compute a
+ *      re-injection top-up. The cross-staker orchestrator {CrossVersionMigrator} deliberately
+ *      depends on the narrower {IStableStakerMigratable} instead, so it needs nothing from here.
  *
  *      The three permissioned functions (`onlyMigrator` on the staker) live in
  *      {IStableStakerMigratable}, the perpetual cross-version contract every `StableStaker`

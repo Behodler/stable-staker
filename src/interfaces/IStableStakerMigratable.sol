@@ -6,7 +6,7 @@ pragma solidity ^0.8.20;
  * @notice The **golden rule** surface: the three permissioned functions that EVERY version of
  *         {StableStaker} — past, present and future — must expose so that a migrator can drain
  *         one version and credit another.
- * @dev Kept intentionally minimal so the migration orchestrators ({StableStakerMigrator},
+ * @dev Kept intentionally minimal so the migration orchestrators ({CrossVersionMigrator},
  *      {InPlaceMigrator}) stay decoupled from the full staker implementation. All three are
  *      gated by `onlyMigrator` on the staker.
  *
