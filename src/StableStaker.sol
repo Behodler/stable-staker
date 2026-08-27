@@ -49,6 +49,13 @@ contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable, IStableS
     /// @notice Seconds in a day, used to convert a per-day budget into a per-second rate.
     uint256 public constant SECONDS_PER_DAY = 86400;
 
+    /// @notice Monotonic identity of this contract's shape. Bumped by the snapshot ritual
+    ///         whenever a deploy freezes the current surface into `src/versions/`.
+    /// @dev The live V1 instance (0xbce8...079A) predates this constant and does NOT expose
+    ///      it. Any version probe must therefore tolerate the call reverting — absence of
+    ///      `STAKER_VERSION` means version 1.
+    uint256 public constant STAKER_VERSION = 2;
+
     /// @notice The phUSD reward token. This contract must be an authorized minter on it.
     IFlax public immutable phUSD;
 

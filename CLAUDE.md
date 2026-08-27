@@ -17,7 +17,16 @@ directly to users on claim / withdraw / migration.
   zero user action, preserving principal and minting earned rewards. Uses the staker's permissioned
   terminal-migration hooks `initiateMigration` (once per token) + `batchMigrate` / `depositFor`
   (caller must be the configured `migrator`). See "Terminal migration mode" below.
+- `src/InPlaceMigrator.sol` — swaps a single staker's yield strategy **in place**, without
+  deploying a new `StableStaker`. Drives the same terminal-migration hooks
+  (`initiateMigration` → `batchMigrate`/`userMigrate` → `finalizeAndReset`) against one contract
+  so an empty pool can be re-wired to a fresh `IYieldStrategy`, with a surplus-funded top-up that
+  re-injects the haircut.
 - `src/interfaces/IStableStaker.sol` — minimal interface the migrator depends on.
+- `src/interfaces/IStableStakerMigratable.sol` — the perpetual "golden rule" interface
+  (`initiateMigration`, `batchMigrate`, `depositFor`) that every version must satisfy.
+- `src/versions/` — frozen, never-edited interface snapshots of each deployed `StableStaker`.
+  See "Evergreen contract and version snapshots" below.
 
 ## Core safety invariant
 
@@ -92,6 +101,51 @@ pool can never resume healthy operation (no resume path), and `stake` / `withdra
 `emergencyWithdraw` / the old staker's `depositFor` are blocked while `active` to preserve the
 snapshot. The `StableStakerMigrator` exposes an owner-only `initiateMigration` forwarder (call once
 per token before the first `migrate` batch).
+
+## Evergreen contract and version snapshots
+
+`src/StableStaker.sol` is **evergreen**: it is the permanently-current implementation and is
+always the one file you edit. It is **never forked into a `StableStakerV2.sol` sitting alongside
+it**, and neither is any other contract in this repo.
+
+Why not: the tradition being rejected lives in `reflax-mint/phlimbo-ea`, where `Phlimbo.sol`,
+`PhlimboV2.sol` and `PhlimboV3.sol` coexist. Forking multiplies near-identical files, splits every
+bug fix across N copies, and leaves each consumer guessing which file is current. The evergreen
+model keeps exactly one canonical implementation and pushes versioning into cheap, non-deployed
+interface snapshots under `src/versions/` — interfaces are not deployed, so a snapshot costs
+nothing against `forge build --sizes`.
+
+### Version identity
+
+`StableStaker.STAKER_VERSION` is a `uint256 public constant` naming the *source's* shape. It is
+currently `2`.
+
+It is deliberately **not** `1`: the deployed instance
+`0xbce8ABC09BaEDCabE93419bF875f6186e182079A` is V1 and predates the constant entirely, so the
+moment `STAKER_VERSION` was added the source stopped describing the deployed bytecode.
+`src/versions/IStableStakerV1.sol` is the only accurate description of that live instance.
+
+Because V1 has no `STAKER_VERSION` getter, **a static call to it reverts**. Any code that probes a
+staker's version must treat a revert as "version 1" rather than propagating the failure. Use a
+low-level `staticcall` and branch on success — never a plain typed call.
+
+There is deliberately no `version()` *function*: a `public constant` costs no storage and matches
+the existing `ACC_PRECISION` / `SECONDS_PER_DAY` idiom in the same file.
+
+### The snapshot-on-deploy ritual
+
+On **any** deploy of `src/StableStaker.sol`:
+
+1. Freeze the current external surface into `src/versions/IStableStakerV<N>.sol`, where `<N>` is
+   the current value of `STAKER_VERSION`.
+2. That file is **never edited again** — it is a historical record, not a source file.
+3. Bump `STAKER_VERSION` to `N + 1` in `src/StableStaker.sol`.
+4. Record the deployed address and the source commit in the new snapshot's NatSpec.
+5. Every snapshot `is IStableStakerMigratable` — no exceptions. That is the golden rule, and
+   extending the perpetual interface makes it a compile-time obligation rather than a convention.
+
+`src/versions/README.md` carries the same ritual with the file-level conventions (interfaces not
+abstract contracts, plain value types over project enums, the snapshot test) spelled out.
 
 ## Dependencies
 
