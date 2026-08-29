@@ -13,7 +13,7 @@ import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import "./interfaces/IStableStaker.sol";
 
 /**
- * @title StableStaker
+ * @title StableStakerV2
  * @notice A MasterChef-style yield farm that supports any number of staked (stable) tokens and
  *         rewards stakers in phUSD. Unlike a classic MasterChef, rewards are not paid from a
  *         pre-funded balance: the contract is an authorized minter of phUSD and mints rewards
@@ -39,7 +39,7 @@ import "./interfaces/IStableStaker.sol";
  *      address pauses; owner OR pauser unpauses. The {emergencyWithdraw} escape hatch and the
  *      migration hooks intentionally remain callable while paused.
  */
-contract StableStaker is Ownable, Pausable, ReentrancyGuard, IPausable, IStableStaker {
+contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStableStaker {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
 

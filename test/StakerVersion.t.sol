@@ -2,26 +2,29 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "flax-token/FlaxToken.sol";
 
-/// @notice Version identity for the evergreen `StableStaker`.
+/// @notice Version identity for the evergreen `StableStakerV2`.
 ///
-/// `src/StableStaker.sol` is never forked into a `StableStakerV2.sol`; each deploy is frozen as an
-/// interface snapshot under `src/versions/` and `STAKER_VERSION` is bumped. These tests pin the
-/// current value and, more importantly, pin the *probe contract*: version detection is a
-/// `staticcall` whose revert means "version 1", because the deployed V1 instance
-/// (0xbce8ABC09BaEDCabE93419bF875f6186e182079A) predates the constant and does not expose it.
+/// The evergreen contract is forked on DEPLOY, not on change: each deploy is frozen into
+/// `src/versions/v<N>/` as full source plus interface, and `STAKER_VERSION` is then bumped
+/// (story 019 — before it, snapshots were interface-only and a fork was forbidden outright).
+/// `STAKER_VERSION` stays at 2 across the V1/V2 file split: the constant, not the filename, is the
+/// identity. These tests pin the current value and, more importantly, pin the *probe contract*:
+/// version detection is a `staticcall` whose revert means "version 1", because the deployed V1
+/// instance (0xbce8ABC09BaEDCabE93419bF875f6186e182079A) predates the constant and does not expose
+/// it. That is also why the frozen `src/versions/v1/StableStakerV1.sol` must never gain the getter.
 contract StakerVersionTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal staker;
+    StableStakerV2 internal staker;
 
     /// @dev The selector any cross-version probe will use against an unknown staker.
     bytes internal constant VERSION_CALLDATA = abi.encodeWithSignature("STAKER_VERSION()");
 
     function setUp() public {
         phUSD = new FlaxToken();
-        staker = new StableStaker(phUSD, address(this));
+        staker = new StableStakerV2(phUSD, address(this));
     }
 
     /// @notice The source is version 2: V1 is what is deployed, and the constant's existence is
@@ -32,7 +35,7 @@ contract StakerVersionTest is Test {
 
     /// @notice Readable through a plain external call, not just as an inlined constant.
     function test_stakerVersionReadableExternally() public view {
-        assertEq(StableStaker(address(staker)).STAKER_VERSION(), 2, "external call must return 2");
+        assertEq(StableStakerV2(address(staker)).STAKER_VERSION(), 2, "external call must return 2");
     }
 
     /// @notice Readable through a raw staticcall — the shape a version probe actually uses.

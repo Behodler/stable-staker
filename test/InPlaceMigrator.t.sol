@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "../src/InPlaceMigrator.sol";
 import "../src/interfaces/IStableStaker.sol";
 import "flax-token/FlaxToken.sol";
@@ -17,7 +17,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 ///         self-only timeout escape hatch (claimTimedOut) returns principal if the operator stalls.
 contract InPlaceMigratorTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal staker;
+    StableStakerV2 internal staker;
     InPlaceMigrator internal migrator;
     MockERC20 internal usdc;
 
@@ -30,7 +30,7 @@ contract InPlaceMigratorTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        staker = new StableStaker(phUSD, owner);
+        staker = new StableStakerV2(phUSD, owner);
         phUSD.setMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
@@ -346,7 +346,7 @@ contract InPlaceMigratorTest is Test {
     function test_claimTimedOut_reentrancyGuarded() public {
         // Use a reentrant token that re-enters claimTimedOut on transfer.
         ReentrantToken evil = new ReentrantToken();
-        StableStaker evilStaker = new StableStaker(phUSD, owner);
+        StableStakerV2 evilStaker = new StableStakerV2(phUSD, owner);
         phUSD.setMinter(address(evilStaker), true);
         evilStaker.addToken(address(evil));
         evilStaker.phUSDPerDay(address(evil), PER_DAY);
@@ -575,7 +575,7 @@ contract InPlaceMigratorTest is Test {
     // ============== TEST 16: zero-credit dust user reverts batch (L-01 out of scope) ==============
 
     function test_m01_zeroCreditDustRevertsBatch() public {
-        // A near-100% haircut makes a tiny first deposit credit 0, so StableStaker.depositFor reverts
+        // A near-100% haircut makes a tiny first deposit credit 0, so StableStakerV2.depositFor reverts
         // ("nothing credited") BEFORE the top-up logic. Documents L-01 as knowingly out of scope.
         address dust = address(0xD057);
         usdc.mint(dust, 1); // 1 wei position
@@ -638,9 +638,9 @@ contract ReentrantToken is MockERC20 {
 contract ReentrantAttacker {
     InPlaceMigrator private immutable migrator;
     ReentrantToken private immutable token;
-    StableStaker private immutable staker;
+    StableStakerV2 private immutable staker;
 
-    constructor(InPlaceMigrator _migrator, ReentrantToken _token, StableStaker _staker) {
+    constructor(InPlaceMigrator _migrator, ReentrantToken _token, StableStakerV2 _staker) {
         migrator = _migrator;
         token = _token;
         staker = _staker;

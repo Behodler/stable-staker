@@ -2,9 +2,9 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "../src/interfaces/IStableStakerMigratable.sol";
-import "../src/versions/IStableStakerV1.sol";
+import "../src/versions/v1/IStableStakerV1.sol";
 import "flax-token/FlaxToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
@@ -36,7 +36,7 @@ contract GoldenRuleTest is Test {
     bytes4 internal constant DEPOSIT_FOR_SELECTOR = 0xb3db428b;
 
     FlaxToken internal phUSD;
-    StableStaker internal staker;
+    StableStakerV2 internal staker;
     MockERC20 internal usdc;
 
     address internal owner = address(this);
@@ -45,7 +45,7 @@ contract GoldenRuleTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        staker = new StableStaker(phUSD, owner);
+        staker = new StableStakerV2(phUSD, owner);
         phUSD.setMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
@@ -86,9 +86,9 @@ contract GoldenRuleTest is Test {
 
     /// @notice The evergreen implementation dispatches those exact selectors.
     function test_implementationExposesFrozenSelectors() public pure {
-        assertEq(StableStaker.initiateMigration.selector, INITIATE_MIGRATION_SELECTOR, "impl initiateMigration drift");
-        assertEq(StableStaker.batchMigrate.selector, BATCH_MIGRATE_SELECTOR, "impl batchMigrate drift");
-        assertEq(StableStaker.depositFor.selector, DEPOSIT_FOR_SELECTOR, "impl depositFor drift");
+        assertEq(StableStakerV2.initiateMigration.selector, INITIATE_MIGRATION_SELECTOR, "impl initiateMigration drift");
+        assertEq(StableStakerV2.batchMigrate.selector, BATCH_MIGRATE_SELECTOR, "impl batchMigrate drift");
+        assertEq(StableStakerV2.depositFor.selector, DEPOSIT_FOR_SELECTOR, "impl depositFor drift");
     }
 
     // ============================== EVERY VERSION SATISFIES THE RULE ==============================

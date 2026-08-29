@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "flax-token/FlaxToken.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -11,7 +11,7 @@ import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 /// @notice Core unit tests for StableStaker: staking math, enumerable set, pausing, escape hatch.
 contract StableStakerTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal staker;
+    StableStakerV2 internal staker;
     MockERC20 internal usdc; // 6 decimals
     MockERC20 internal dai; // 18 decimals
 
@@ -25,7 +25,7 @@ contract StableStakerTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        staker = new StableStaker(phUSD, owner);
+        staker = new StableStakerV2(phUSD, owner);
         phUSD.setMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);

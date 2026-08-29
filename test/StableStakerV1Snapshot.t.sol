@@ -2,32 +2,39 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
-import "../src/versions/IStableStakerV1.sol";
+import "../src/StableStakerV2.sol";
+import "../src/versions/v1/StableStakerV1.sol";
+import "../src/versions/v1/IStableStakerV1.sol";
 import "flax-token/FlaxToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 
-/// @notice Fidelity proof for the frozen V1 snapshot, `src/versions/IStableStakerV1.sol`.
+/// @notice Fidelity proof for the frozen V1 snapshot, `src/versions/v1/IStableStakerV1.sol`.
 ///
-/// @dev The strongest guarantee here is again the COMPILER's: every call below is made through an
-///      `IStableStakerV1` handle pointing at a real `StableStaker`, so if the snapshot ever declared
-///      a member the implementation does not have — wrong name, wrong parameter types, wrong return
-///      arity — this file would fail to compile or the call would hit the "function does not exist"
-///      path. That makes the test a compile-and-call proof that the snapshot is a faithful *subset*
-///      of `src/StableStaker.sol`.
+/// @dev The subject is the FROZEN CONTRACT `src/versions/v1/StableStakerV1.sol` — the source of the
+///      live mainnet instance 0xbce8ABC09BaEDCabE93419bF875f6186e182079A — not the evergreen
+///      `StableStakerV2`. Story 019 retargeted it there. Before the pivot the cast was made against
+///      the evergreen contract, which was the wrong subject: V2 is explicitly free to diverge from
+///      V1, so a fidelity failure there would have meant nothing about the deployed shape.
 ///
-///      What it deliberately does NOT prove: that the live mainnet instance at
+///      The strongest guarantee here is again the COMPILER's: every call below is made through an
+///      `IStableStakerV1` handle pointing at a real `StableStakerV1`, so if the snapshot ever
+///      declared a member the frozen contract does not have — wrong name, wrong parameter types,
+///      wrong return arity — this file would fail to compile or the call would hit the "function
+///      does not exist" path. That makes the test a compile-and-call proof that the interface
+///      snapshot is a faithful *subset* of the frozen V1 source.
+///
+///      What it deliberately does NOT prove: that the live mainnet bytecode at
 ///      0xbce8ABC09BaEDCabE93419bF875f6186e182079A matches. That needs a fork test, and deployment
 ///      reconciliation was explicitly retained by the human.
 ///
-///      Direction of the guarantee matters. This proves snapshot ⊆ implementation. It does not
-///      prove implementation ⊆ snapshot, and it must not: `StableStaker.sol` is the evergreen
-///      current version and is expected to grow past V1. When it does, the answer is a NEW snapshot
-///      under `src/versions/`, never an edit to this one.
+///      Direction of the guarantee matters. This proves snapshot ⊆ frozen V1. It does not prove
+///      frozen V1 ⊆ snapshot, and it must not. Nor does it constrain `StableStakerV2`, which is the
+///      evergreen contract and is expected to grow past V1; when V2 is deployed the answer is a NEW
+///      `src/versions/v2/` snapshot, never an edit to this one.
 contract StableStakerV1SnapshotTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal staker;
+    StableStakerV1 internal staker;
     MockERC20 internal usdc;
     MockYieldStrategy internal strategy;
 
@@ -42,7 +49,7 @@ contract StableStakerV1SnapshotTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        staker = new StableStaker(phUSD, owner);
+        staker = new StableStakerV1(phUSD, owner);
         phUSD.setMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
@@ -66,8 +73,8 @@ contract StableStakerV1SnapshotTest is Test {
 
     // ============================== IDENTITY ==============================
 
-    /// @notice A deployed `StableStaker` is castable to the frozen V1 snapshot, and the cast
-    ///         resolves to the staker itself (no proxy or adapter hop).
+    /// @notice A deployed frozen `StableStakerV1` is castable to the frozen V1 snapshot, and the
+    ///         cast resolves to the staker itself (no proxy or adapter hop).
     function test_stakerIsCastableToV1Snapshot() public view {
         assertEq(address(v1), address(staker), "V1 cast must resolve to the staker itself");
     }
@@ -81,17 +88,31 @@ contract StableStakerV1SnapshotTest is Test {
 
         assertEq(
             IStableStakerMigratable.initiateMigration.selector,
-            StableStaker.initiateMigration.selector,
+            StableStakerV1.initiateMigration.selector,
             "initiateMigration selector drift"
         );
         assertEq(
             IStableStakerMigratable.batchMigrate.selector,
-            StableStaker.batchMigrate.selector,
+            StableStakerV1.batchMigrate.selector,
             "batchMigrate selector drift"
         );
         assertEq(
-            IStableStakerMigratable.depositFor.selector, StableStaker.depositFor.selector, "depositFor selector drift"
+            IStableStakerMigratable.depositFor.selector, StableStakerV1.depositFor.selector, "depositFor selector drift"
         );
+    }
+
+    /// @notice **NON-BINDING.** Documents that, as of story 019, the evergreen `StableStakerV2`
+    ///         still happens to satisfy the frozen V1 interface. This is an observation about the
+    ///         present, NOT a constraint on V2.
+    /// @dev If a future story makes V2 diverge from `IStableStakerV1`, DELETE this function. Do not
+    ///      bend `StableStakerV2` to keep it compiling, and never edit the frozen interface. The
+    ///      binding fidelity subject is `StableStakerV1`, exercised by every other test in this file.
+    function test_NONBINDING_v2StillOverlapsV1Abi() public {
+        StableStakerV2 v2Impl = new StableStakerV2(phUSD, owner);
+        IStableStakerV1 v2AsV1 = IStableStakerV1(address(v2Impl));
+        assertEq(address(v2AsV1), address(v2Impl), "V2 currently still casts to the V1 surface");
+        assertEq(v2AsV1.ACC_PRECISION(), 1e18, "overlapping member must dispatch on V2 too");
+        assertEq(v2Impl.STAKER_VERSION(), 2, "V2 carries the version getter that frozen V1 lacks");
     }
 
     // ============================== OWNER CONFIG ==============================

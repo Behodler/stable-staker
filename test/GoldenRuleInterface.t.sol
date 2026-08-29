@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "../src/interfaces/IStableStaker.sol";
 import "../src/interfaces/IStableStakerMigratable.sol";
 import "flax-token/FlaxToken.sol";
@@ -11,7 +11,7 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 /// @notice The golden rule: EVERY version of `StableStaker` must expose `initiateMigration`,
 ///         `batchMigrate` and `depositFor` so a migrator can always drain one version and credit
 ///         another. Story 014 turned that convention into a compile-time obligation by declaring
-///         `contract StableStaker is ... IStableStaker`.
+///         `contract StableStakerV2 is ... IStableStaker`.
 ///
 /// @dev The strongest guarantee here is the COMPILER's, not this file's: once `StableStaker`
 ///      declares `is IStableStaker`, deleting any of the three functions fails the build outright,
@@ -23,7 +23,7 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 ///      change the selector and break migration silently at the call site; this catches that.
 contract GoldenRuleInterfaceTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal staker;
+    StableStakerV2 internal staker;
     MockERC20 internal usdc;
 
     address internal owner = address(this);
@@ -32,7 +32,7 @@ contract GoldenRuleInterfaceTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        staker = new StableStaker(phUSD, owner);
+        staker = new StableStakerV2(phUSD, owner);
         phUSD.setMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
@@ -61,16 +61,16 @@ contract GoldenRuleInterfaceTest is Test {
 
         assertEq(
             IStableStakerMigratable.initiateMigration.selector,
-            StableStaker.initiateMigration.selector,
+            StableStakerV2.initiateMigration.selector,
             "initiateMigration selector drift"
         );
         assertEq(
             IStableStakerMigratable.batchMigrate.selector,
-            StableStaker.batchMigrate.selector,
+            StableStakerV2.batchMigrate.selector,
             "batchMigrate selector drift"
         );
         assertEq(
-            IStableStakerMigratable.depositFor.selector, StableStaker.depositFor.selector, "depositFor selector drift"
+            IStableStakerMigratable.depositFor.selector, StableStakerV2.depositFor.selector, "depositFor selector drift"
         );
     }
 

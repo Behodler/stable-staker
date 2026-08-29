@@ -2,14 +2,14 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "flax-token/FlaxToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// @notice The safety spec: no sequence of user actions can mint more than phUSDPerDay for a token.
 contract EmissionCapTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal staker;
+    StableStakerV2 internal staker;
     MockERC20 internal usdc;
 
     address internal owner = address(this);
@@ -20,7 +20,7 @@ contract EmissionCapTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        staker = new StableStaker(phUSD, owner);
+        staker = new StableStakerV2(phUSD, owner);
         phUSD.setMinter(address(staker), true);
         usdc = new MockERC20("USD Coin", "USDC", 6);
         staker.addToken(address(usdc));

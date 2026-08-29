@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "../src/CrossVersionMigrator.sol";
 import "../src/interfaces/IStableStaker.sol";
 import "flax-token/FlaxToken.sol";
@@ -16,8 +16,8 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 ///         identical across batch composition, ordering, and batch-vs-self exit.
 contract MigrationTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal oldStaker;
-    StableStaker internal newStaker;
+    StableStakerV2 internal oldStaker;
+    StableStakerV2 internal newStaker;
     CrossVersionMigrator internal migrator;
     MockERC20 internal usdc;
 
@@ -29,8 +29,8 @@ contract MigrationTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        oldStaker = new StableStaker(phUSD, owner);
-        newStaker = new StableStaker(phUSD, owner);
+        oldStaker = new StableStakerV2(phUSD, owner);
+        newStaker = new StableStakerV2(phUSD, owner);
 
         // both instances may mint phUSD
         phUSD.setMinter(address(oldStaker), true);
@@ -243,8 +243,8 @@ contract MigrationTest is Test {
         returns (uint256 alicePayout, uint256 bobPayout)
     {
         // Fresh isolated deployment so permutations don't interfere.
-        StableStaker oStaker = new StableStaker(phUSD, owner);
-        StableStaker nStaker = new StableStaker(phUSD, owner);
+        StableStakerV2 oStaker = new StableStakerV2(phUSD, owner);
+        StableStakerV2 nStaker = new StableStakerV2(phUSD, owner);
         phUSD.setMinter(address(oStaker), true);
         phUSD.setMinter(address(nStaker), true);
         oStaker.addToken(address(usdc));
@@ -316,7 +316,7 @@ contract MigrationTest is Test {
         }
     }
 
-    function _newCredit(StableStaker s, address who) internal view returns (uint256 amt) {
+    function _newCredit(StableStakerV2 s, address who) internal view returns (uint256 amt) {
         (amt,) = s.userInfo(address(usdc), who);
     }
 
@@ -522,7 +522,7 @@ contract MigrationTest is Test {
         _stakeAliceAndBob(); // no strategy: principal sits idle in the contract
         migrator.initiateMigration(address(usdc));
         (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
-        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Migrating));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStakerV2.PoolState.Migrating));
         assertEq(R, 400e6);
         assertEq(P, 400e6);
 
@@ -566,7 +566,7 @@ contract MigrationTest is Test {
     function test_stateMachine_illegalOpsRevertPerState() public {
         _stakeAliceAndBob(); // need stakers present to test state-machine transitions
         // --- Active state: migration-only ops are rejected ---
-        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStakerV2.PoolState.Active));
         vm.prank(address(migrator));
         vm.expectRevert(bytes("StableStaker: pool not migrating"));
         oldStaker.batchMigrate(address(usdc), _users());
@@ -579,7 +579,7 @@ contract MigrationTest is Test {
 
         // --- Active -> Migrating ---
         migrator.initiateMigration(address(usdc));
-        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Migrating));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStakerV2.PoolState.Migrating));
 
         // While Migrating: stake / withdraw / setYieldStrategy / initiateMigration all revert.
         usdc.mint(alice, 1e6);
@@ -610,7 +610,7 @@ contract MigrationTest is Test {
         assertEq(totalStaked, 0);
 
         oldStaker.finalizeAndReset(address(usdc));
-        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStakerV2.PoolState.Active));
         (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
         assertEq(R, 0);
         assertEq(P, 0);
@@ -667,9 +667,9 @@ contract MigrationTest is Test {
 
         // Reset the SAME pool back to Active.
         vm.expectEmit(true, false, false, false);
-        emit StableStaker.PoolReset(address(usdc));
+        emit StableStakerV2.PoolReset(address(usdc));
         oldStaker.finalizeAndReset(address(usdc));
-        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStakerV2.PoolState.Active));
 
         // Wire a FRESH, at-par strategy (old wiring was cleared to address(0) at initiateMigration,
         // so 008's underwater guard is skipped here).
@@ -725,7 +725,7 @@ contract MigrationTest is Test {
 
         // finalizeAndReset succeeds while paused.
         oldStaker.finalizeAndReset(address(usdc));
-        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+        assertEq(uint256(oldStaker.poolState(address(usdc))), uint256(StableStakerV2.PoolState.Active));
 
         // setYieldStrategy succeeds while paused.
         MockYieldStrategy fresh = new MockYieldStrategy();
@@ -797,7 +797,7 @@ contract MigrationTest is Test {
 }
 
 /// @notice Strategy whose withdraw only realizes part of the requested principal per call, leaving
-///         principalOf > 0 so {StableStaker.initiateMigration}'s post-check trips. Models a
+///         principalOf > 0 so {StableStakerV2.initiateMigration}'s post-check trips. Models a
 ///         tranche/queue vault that cannot exit atomically.
 contract UnderRealizingStrategy is IYieldStrategy {
     using SafeERC20 for IERC20;

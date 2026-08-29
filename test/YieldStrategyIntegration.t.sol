@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "flax-token/FlaxToken.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -11,7 +11,7 @@ import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 /// @notice Integration tests for routing staked principal through a per-token IYieldStrategy.
 contract YieldStrategyIntegrationTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal staker;
+    StableStakerV2 internal staker;
     MockERC20 internal usdc; // 6 decimals
     MockYieldStrategy internal strategy;
 
@@ -28,7 +28,7 @@ contract YieldStrategyIntegrationTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        staker = new StableStaker(phUSD, owner);
+        staker = new StableStakerV2(phUSD, owner);
         phUSD.setMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
@@ -565,7 +565,7 @@ contract YieldStrategyIntegrationTest is Test {
         // Engage terminal migration: holds the realized payout pile as idle balance, decoupled.
         vm.prank(migrator);
         staker.initiateMigration(address(usdc));
-        assertEq(uint256(staker.poolState(address(usdc))), uint256(StableStaker.PoolState.Migrating));
+        assertEq(uint256(staker.poolState(address(usdc))), uint256(StableStakerV2.PoolState.Migrating));
 
         // setYieldStrategy must now be blocked — an unguarded sweep would brick userMigrate/batchMigrate.
         MockYieldStrategy strategy2 = new MockYieldStrategy();
@@ -783,7 +783,7 @@ contract YieldStrategyIntegrationTest is Test {
         assertEq(staker.stakerCount(address(usdc)), 0);
 
         staker.finalizeAndReset(address(usdc));
-        assertEq(uint256(staker.poolState(address(usdc))), uint256(StableStaker.PoolState.Active));
+        assertEq(uint256(staker.poolState(address(usdc))), uint256(StableStakerV2.PoolState.Active));
 
         // Wire a fresh strategy on the revived empty pool — must succeed.
         MockYieldStrategy fresh = new MockYieldStrategy();

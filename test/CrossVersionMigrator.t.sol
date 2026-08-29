@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/StableStaker.sol";
+import "../src/StableStakerV2.sol";
 import "../src/CrossVersionMigrator.sol";
 import "../src/interfaces/IStableStakerMigratable.sol";
 import "flax-token/FlaxToken.sol";
@@ -30,8 +30,8 @@ contract FutureVersionStaker {
 ///         compensation.
 contract CrossVersionMigratorTest is Test {
     FlaxToken internal phUSD;
-    StableStaker internal oldStaker;
-    StableStaker internal newStaker;
+    StableStakerV2 internal oldStaker;
+    StableStakerV2 internal newStaker;
     CrossVersionMigrator internal migrator;
     MockERC20 internal usdc;
 
@@ -48,8 +48,8 @@ contract CrossVersionMigratorTest is Test {
 
     function setUp() public {
         phUSD = new FlaxToken();
-        oldStaker = new StableStaker(phUSD, owner);
-        newStaker = new StableStaker(phUSD, owner);
+        oldStaker = new StableStakerV2(phUSD, owner);
+        newStaker = new StableStakerV2(phUSD, owner);
 
         // both instances may mint phUSD
         phUSD.setMinter(address(oldStaker), true);
