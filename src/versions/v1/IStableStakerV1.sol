@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "flax-token/IFlax.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
-import "../interfaces/IStableStakerMigratable.sol";
+import "../../interfaces/IStableStakerMigratable.sol";
 
 /**
  * @title IStableStakerV1
