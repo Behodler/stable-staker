@@ -44,7 +44,10 @@ import "./interfaces/IStableStakerMigratable.sol";
  *
  *        - destination token registration, probed via `getStakedTokens()`
  *          ("Migrator: destination token not registered");
- *        - destination wiring, probed via `migrator()` ("Migrator: destination not wired").
+ *        - destination wiring, probed via `migrator()` ("Migrator: destination not wired");
+ *        - and, in the constructor, `_oldStaker != _newStaker` ("Migrator: aliased stakers"), since
+ *          an aliased pair would freeze a staker and then attempt to `depositFor` back into the
+ *          pool it just froze.
  *
  *      What remains a RUNBOOK OBLIGATION, unguarded and uncheckable from here:
  *
@@ -53,9 +56,6 @@ import "./interfaces/IStableStakerMigratable.sol";
  *        - source-side `setMigrator`. The live V1 is deployed and unpatchable, and nothing this
  *          contract can do protects against the SOURCE being mis-wired; that still fails only at
  *          call time.
- *        - the constructor additionally rejects `_oldStaker == _newStaker`
- *          ("Migrator: aliased stakers"), which would otherwise freeze a staker and then attempt to
- *          `depositFor` back into the pool it just froze.
  *
  *      ADVISORY ON PROBE FAILURE. Both pre-flight checks are staticcall probes on getters that are
  *      NOT part of `IStableStakerMigratable` and must not be added to it — widening the triad would
