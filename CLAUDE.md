@@ -9,7 +9,8 @@ tokens and rewards stakers in **phUSD** (the `FlaxToken` from the `flax-token` d
 Rewards are not pre-funded: this contract is an authorized phUSD **minter** and mints rewards
 directly to users on claim / withdraw / migration.
 
-- `src/StableStaker.sol` — the farm. Per-token pools, owner-set `phUSDPerDay(token, amount)`
+- `src/StableStakerV2.sol` — the farm, and the **evergreen** contract: all forward work happens
+  here. Per-token pools, owner-set `phUSDPerDay(token, amount)`
   emission budget, per-token `EnumerableSet` of stakers (`getStakers` / `getStakersRange` /
   `stakerCount`), Behodler3 pausing (`pauser` + `IPausable`), and a permissionless
   `emergencyWithdraw` escape hatch.
@@ -31,8 +32,11 @@ directly to users on claim / withdraw / migration.
   golden-rule triad plus the `userInfo` getter its top-up needs).
 - `src/interfaces/IStableStakerMigratable.sol` — the perpetual "golden rule" interface
   (`initiateMigration`, `batchMigrate`, `depositFor`) that every version must satisfy.
-- `src/versions/` — frozen, never-edited interface snapshots of each deployed `StableStaker`.
-  See "Evergreen contract and version snapshots" below.
+- `src/versions/v<N>/` — frozen, never-edited snapshots of each **deployed** staker: the full
+  contract source (`StableStakerV<N>.sol`) *and* its interface (`IStableStakerV<N>.sol`), pinned
+  by `FROZEN.sha256`. `v1/` is the source of the live mainnet instance
+  `0xbce8ABC09BaEDCabE93419bF875f6186e182079A`, bugs included. See "Version snapshots and the
+  evergreen contract" below.
 
 ## Core safety invariant
 
@@ -44,7 +48,7 @@ per update; the sum of all stakers' pending increase equals that minus integer-d
 
 ## Wiring (deployment)
 
-1. Deploy `StableStaker(phUSD, owner)`.
+1. Deploy `StableStakerV2(phUSD, owner)`.
 2. phUSD owner calls `phUSD.setMinter(address(staker), true)`.
 3. `staker.addToken(token)` for each stable, then `staker.phUSDPerDay(token, amountPerDay)`.
 4. Optional: `staker.setPauser(pauser)`, `staker.setMigrator(migrator)`.
@@ -159,7 +163,9 @@ declare their own local interfaces and are unaffected.
 They are declared in `src/interfaces/IStableStakerMigratable.sol` and are the whole of a
 cross-version hop: `initiateMigration` freezes the source pool, `batchMigrate` drains it,
 `depositFor` credits the destination. Every version snapshot under `src/versions/` inherits that
-interface, and `StableStaker` declares `is IStableStaker` (which extends it).
+interface: the frozen `src/versions/v1/IStableStakerV1.sol` declares
+`is IStableStakerMigratable`, and the evergreen `StableStakerV2` declares `is IStableStaker`
+(which extends it).
 
 **Why it is permanent.** Remove one — or reshape a signature, which is the same thing at the wire
 level — and the users staked in the deployed V1 instance
@@ -171,28 +177,34 @@ The `token` first parameter is load-bearing: a `StableStaker` is multi-pool. A f
 redesign that dropped it would break the golden rule by construction — see the long note in
 `IStableStakerMigratable.sol`.
 
-**If the build complains** that `StableStaker` does not implement one of the three, the fix is to
-RESTORE the function on the contract. Never delete the declaration from the interface or from a
-`src/versions/` snapshot to make the error go away — that is the exact failure the layers below
-exist to catch.
+**If the build complains** that `StableStakerV2` does not implement one of the three, the fix is to
+RESTORE the function on the contract. Never delete the declaration from the interface, and never
+edit anything under `src/versions/` to make the error go away — that is the exact failure the
+layers below exist to catch.
 
 ### Four layers of enforcement
 
-1. **The compiler.** `StableStaker is IStableStaker`, so deleting one of the three from the
-   contract fails the build (story 014).
+1. **The compiler.** `StableStakerV2 is IStableStaker`, so deleting one of the three from the
+   evergreen contract fails the build (story 014).
 2. **A `PreToolUse` hook** — `.claude/hooks/protect-migration-surface.sh`, registered in
    `.claude/settings.json`. Denies an `Edit`/`Write` under `src/` that removes a protected
    declaration, and denies a `git commit` whose staged tree declares one fewer time than `HEAD`.
    Fails closed. **Known gap**: a hook only fires when `stable-staker` is the session's project
    root, and this repo is normally driven as a submodule — see `.claude/hooks/README.md`.
 3. **A CI gate** — `.github/scripts/check-migration-surface.sh`, run on every push. Checks the
-   perpetual interface, the evergreen implementation, and that every `src/versions/` snapshot still
-   reads `is IStableStakerMigratable`. No blind spot about which directory an agent was driven from.
-4. **`test/GoldenRule.t.sol`** — pins the three selectors to hard-coded byte constants, so a
+   perpetual interface, the evergreen implementation (`src/StableStakerV2.sol`), that every
+   `src/versions/v*/IStableStakerV*.sol` still reads `is IStableStakerMigratable`, and — since
+   story 019 — that the frozen V1 files still **exist** and still **hash** to the values pinned in
+   `src/versions/v1/FROZEN.sha256`. That last check closes audit finding `ss14l3` / `L-03`: the
+   gate used to catch mutation of the migration surface but treated a deleted snapshot as a mere
+   note. No blind spot about which directory an agent was driven from.
+4. **`test/GoldenRule.t.sol`** and **`test/StableStakerV1Frozen.t.sol`** — the former pins the three selectors to hard-coded byte constants, so a
    coordinated redesign that changes interface and implementation together still fails. Those
    constants are not a magic number to update when the test goes red; they are the wire format the
-   live instance answers to. `test/GoldenRuleInterface.t.sol` additionally asserts the triad stays
-   `onlyMigrator`-gated and reachable through the interface.
+   live instance answers to. The latter deploys the frozen `StableStakerV1` with the real mainnet
+   constructor arguments and asserts the same three selectors dispatch on it, so V1's compliance is
+   proven against a deployable contract rather than an interface. `test/GoldenRuleInterface.t.sol`
+   additionally asserts the triad stays `onlyMigrator`-gated and reachable through the interface.
 
 ### Overriding the rule
 
@@ -201,50 +213,110 @@ commit message. The hook allows the commit and prints a loud warning. A rule wit
 exit gets worked around destructively — this one has a door, and using it is recorded permanently
 in git history. Using it while V1 still holds stakers is a decision to strand them.
 
-## Evergreen contract and version snapshots
+## Version snapshots and the evergreen contract
 
-`src/StableStaker.sol` is **evergreen**: it is the permanently-current implementation and is
-always the one file you edit. It is **never forked into a `StableStakerV2.sol` sitting alongside
-it**, and neither is any other contract in this repo.
+`src/StableStakerV2.sol` is the **evergreen** contract: the permanently-current implementation and
+the one file you edit for forward work. Alongside it, `src/versions/v<N>/` holds a **frozen full
+copy of every version that has actually been deployed**, source and interface both.
 
-Why not: the tradition being rejected lives in `reflax-mint/phlimbo-ea`, where `Phlimbo.sol`,
-`PhlimboV2.sol` and `PhlimboV3.sol` coexist. Forking multiplies near-identical files, splits every
-bug fix across N copies, and leaves each consumer guessing which file is current. The evergreen
-model keeps exactly one canonical implementation and pushes versioning into cheap, non-deployed
-interface snapshots under `src/versions/` — interfaces are not deployed, so a snapshot costs
-nothing against `forge build --sizes`.
+### Fork on DEPLOY, not on change — and the story-019 correction
+
+Story 016 established a single evergreen `StableStaker.sol` with interface-only snapshots, and
+explicitly instructed that it must **never** be forked into a `StableStakerV2.sol`. **Story 019
+reversed that instruction.** If you find a leftover statement anywhere in this repo forbidding a
+`StableStakerV<N>.sol`, it is stale — this section is the current rule.
+
+The distinction that makes both stories right is *when* you fork:
+
+- **Never fork on a change.** The tradition being rejected lives in `reflax-mint/phlimbo-ea`,
+  where `Phlimbo.sol`, `PhlimboV2.sol` and `PhlimboV3.sol` coexist as rival current
+  implementations. Forking per change multiplies near-identical files, splits every bug fix
+  across N copies, and leaves each consumer guessing which file is current. There is exactly one
+  evergreen, and it is `StableStakerV2.sol`.
+- **Always fork on a deploy.** A deployed contract is immutable and its behaviour must remain
+  reasonable-about forever. Story 016 assumed that once a version is superseded nobody needs to
+  reason about its behaviour again — an interface would do. That assumption failed: the live V1
+  at `0xbce8ABC09BaEDCabE93419bF875f6186e182079A` has known defects (`ss14m1`, `ss14l8`) and
+  still holds un-migrated stakers. A recovery runbook, a fork test or an audit that needs to
+  reason about deployed behaviour must be able to **compile** it, and an interface can be neither
+  deployed nor fork-tested.
+
+The frozen copies are not rival implementations: nothing inherits from them, nothing deploys them
+to production, and they are never edited. They are historical records that happen to compile.
+
+### Frozen means frozen — including the bugs
+
+`src/versions/v1/StableStakerV1.sol` reproduces `git show c3ec65b:src/StableStaker.sol`, with only
+the divergences enumerated in its own header (a contract rename forced by Foundry artifact
+resolution, plus that header). Its known defects — `ss14m1` (terminal migration bricked by
+`setYieldStrategy`'s unrecorded idle sweep) and `ss14l8` (set-aside buffer excluded from the
+migration realized amount `R`) — are preserved **deliberately**. Fixing them there would make the
+file lie about bytecode that is already on chain, which is the single failure mode `src/versions/`
+exists to prevent. Fix them in the evergreen `StableStakerV2` and in the operational recovery plan.
+An audit that re-files those two findings against `src/versions/` should be triaged as
+"deliberately preserved", not actioned.
+
+`.github/scripts/check-migration-surface.sh` enforces this: a missing or modified frozen file is a
+hard CI failure. Regenerating `FROZEN.sha256` to match an edit defeats the check and is not an
+acceptable fix — restore the file instead.
 
 ### Version identity
 
-`StableStaker.STAKER_VERSION` is a `uint256 public constant` naming the *source's* shape. It is
-currently `2`.
+`StableStakerV2.STAKER_VERSION` is a `uint256 public constant` naming the *source's* shape. It is
+currently `2`, and it is **not** renumbered by the V1/V2 file split.
 
-It is deliberately **not** `1`: the deployed instance
-`0xbce8ABC09BaEDCabE93419bF875f6186e182079A` is V1 and predates the constant entirely, so the
-moment `STAKER_VERSION` was added the source stopped describing the deployed bytecode.
-`src/versions/IStableStakerV1.sol` is the only accurate description of that live instance.
+It is deliberately not `1`: the deployed instance `0xbce8ABC09BaEDCabE93419bF875f6186e182079A` is
+V1 and predates the constant entirely, so the moment `STAKER_VERSION` was added the evergreen
+source stopped describing the deployed bytecode. `src/versions/v1/` is the only accurate
+description of that live instance.
 
 Because V1 has no `STAKER_VERSION` getter, **a static call to it reverts**. Any code that probes a
-staker's version must treat a revert as "version 1" rather than propagating the failure. Use a
-low-level `staticcall` and branch on success — never a plain typed call.
+staker's version must treat a revert as "version 1" rather than propagating the failure — use a
+low-level `staticcall` and branch on success, never a plain typed call.
+`CrossVersionMigrator.versionOf` does exactly this. It follows that the frozen
+`StableStakerV1.sol` must **never gain a `STAKER_VERSION` getter**: adding one would both lie
+about the deployed bytecode and break that probe. `test/StableStakerV1Frozen.t.sol` asserts its
+absence.
 
 There is deliberately no `version()` *function*: a `public constant` costs no storage and matches
 the existing `ACC_PRECISION` / `SECONDS_PER_DAY` idiom in the same file.
 
 ### The snapshot-on-deploy ritual
 
-On **any** deploy of `src/StableStaker.sol`:
+On **any** deploy of `src/StableStakerV2.sol`, where `<N>` is its current `STAKER_VERSION` and
+`<C>` is the commit actually deployed:
 
-1. Freeze the current external surface into `src/versions/IStableStakerV<N>.sol`, where `<N>` is
-   the current value of `STAKER_VERSION`.
-2. That file is **never edited again** — it is a historical record, not a source file.
-3. Bump `STAKER_VERSION` to `N + 1` in `src/StableStaker.sol`.
-4. Record the deployed address and the source commit in the new snapshot's NatSpec.
-5. Every snapshot `is IStableStakerMigratable` — no exceptions. That is the golden rule, and
-   extending the perpetual interface makes it a compile-time obligation rather than a convention.
+1. **Establish `<C>` from deployment evidence, not from `master` HEAD.** Cross-check the
+   `phase-2-staging` submodule pointer on the deploy day, the broadcast JSON under
+   `phase-2-staging/broadcast/`, and `phase-2-staging/server/deployments/mainnet-addresses.ts`.
+   Snapshotting from HEAD is only correct by luck; this is audit finding `ss14l4` / `L-04`.
+2. Generate the frozen source **mechanically** —
+   `git show <C>:src/StableStakerV<N>.sol > src/versions/v<N>/StableStakerV<N>.sol` — never by
+   hand. Freeze its external surface into `src/versions/v<N>/IStableStakerV<N>.sol` from the same
+   commit.
+3. Apply only the minimum divergences needed to coexist and compile (contract rename on collision;
+   import-path and pragma fixes if library pins have moved) and **enumerate every one in a
+   "Permitted divergences" block in the file header**. Revert strings are ABI-visible behaviour and
+   stay verbatim. If only a *logic* edit would make it compile — anything touching storage layout
+   or an external signature — **stop and escalate to a human**: the copy could no longer honestly
+   claim to be the deployed source.
+4. Those files are **never edited again**. Pin them with `sha256sum … > FROZEN.sha256` and add the
+   pair to `FROZEN_FILES` in `.github/scripts/check-migration-surface.sh`.
+5. Record the deployed address, source commit, deploy date and a **NEVER EDIT THIS FILE** notice in
+   both files' NatSpec.
+6. Add `test/StableStakerV<N>Frozen.t.sol` (deploys the frozen contract with the real broadcast
+   constructor arguments; proves it is deployable, not merely parseable) and
+   `test/StableStakerV<N>Snapshot.t.sol` (casts the **frozen** contract through the new interface
+   and exercises every member). Point fidelity tests at the frozen contract, never at the
+   evergreen — the evergreen is free to diverge, so a fidelity assertion against it proves nothing.
+7. Bump `STAKER_VERSION` to `N + 1` in `src/StableStakerV2.sol` and update
+   `test/StakerVersion.t.sol`. (Rename the evergreen contract only if a human decides to; the
+   constant, not the filename, is the identity.)
+8. Every snapshot interface `is IStableStakerMigratable` — no exceptions. That is the golden rule,
+   and extending the perpetual interface makes it a compile-time obligation rather than a
+   convention.
 
-`src/versions/README.md` carries the same ritual with the file-level conventions (interfaces not
-abstract contracts, plain value types over project enums, the snapshot test) spelled out.
+`src/versions/README.md` carries the same ritual with the file-level conventions spelled out.
 
 ## Dependencies
 
