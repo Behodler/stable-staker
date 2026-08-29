@@ -7,7 +7,20 @@ Guidance for Claude Code when working in the `stable-staker` submodule.
 `stable-staker` is a MasterChef-style yield farm that supports any number of staked (stable)
 tokens and rewards stakers in **phUSD** (the `FlaxToken` from the `flax-token` dependency).
 Rewards are not pre-funded: this contract is an authorized phUSD **minter** and mints rewards
-directly to users on claim / withdraw / migration.
+directly to users on **claim and terminal migration only**. `stake` and `withdraw` no longer touch
+phUSD at all — they *book* the settled amount to the `unclaimedReward` mapping, which `claim` pays
+out (story 022). That is deliberate robustness: a revoked minter role, or any phUSD revert, can no
+longer brick a principal path. Consequences worth knowing:
+
+- `emergencyWithdraw` forfeits the `unclaimedReward` backlog as well as the live pending — the
+  escape hatch stays the single rule "no reward, principal out", and never mints.
+- `claim` is still `whenNotPaused`, so a pause now withholds the accumulated backlog too.
+- `claimableReward(token, account)` is the read for "what can I claim right now"; it returns
+  `unclaimedReward + pendingReward`, exactly what `claim` mints.
+- `pendingReward` is unchanged and is the **live projection only**, excluding the backlog — its
+  meaning must stay identical to the frozen V1 selector of the same name, because the cross-version
+  migrator means both versions are read side by side.
+- See `docs/deferred-reward-accrual-plan.md`.
 
 - `src/StableStakerV2.sol` — the farm, and the **evergreen** contract: all forward work happens
   here. Per-token pools, owner-set `phUSDPerDay(token, amount)`
@@ -40,11 +53,19 @@ directly to users on claim / withdraw / migration.
 
 ## Core safety invariant
 
-No sequence of user actions can mint more than `phUSDPerDay` for a token over any window. The only
-writer of `accPhusdPerShare` is `_updatePool`, which folds in exactly `elapsed * phusdPerSecond`
-per update; the sum of all stakers' pending increase equals that minus integer-division dust
-(which always rounds DOWN). Empty-pool windows accrue nothing; flash staking earns nothing;
-`phUSDPerDay` settles the pool at the old rate before changing it. See `test/EmissionCap.t.sol`.
+No sequence of user actions can **accrue** more than `phUSDPerDay` for a token over any window,
+and cumulative *minted* is always `<=` cumulative *accrued*. The only writer of `accPhusdPerShare`
+is `_updatePool`, which folds in exactly `elapsed * phusdPerSecond` per update; the sum of all
+stakers' pending increase equals that minus integer-division dust (which always rounds DOWN).
+Empty-pool windows accrue nothing; flash staking earns nothing; `phUSDPerDay` settles the pool at
+the old rate before changing it.
+
+Since story 022, reward is *booked* to `unclaimedReward` rather than transferred on
+`stake`/`withdraw`, so minted alone understates what was accrued. The statement carrying the
+invariant is `sum(unclaimedReward) + minted <= cap`. Payout timing is strictly downstream of
+accrual — no new path writes `accPhusdPerShare` — so the cap holds a fortiori. Read the claimable
+total via `claimableReward`; `pendingReward` remains projection-only and excludes the backlog. See
+`test/EmissionCap.t.sol` and `test/DeferredAccrual.t.sol`.
 
 ## Wiring (deployment)
 
