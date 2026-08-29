@@ -23,6 +23,19 @@ contract FutureVersionStaker {
     uint256 public constant STAKER_VERSION = 7;
 }
 
+/// @notice A destination exposing ONLY the golden-rule triad — no `migrator()`, no
+///         `getStakedTokens()`, no `STAKER_VERSION`. Stands in for a future staker shape this
+///         migrator does not recognise, against which both pre-flight probes must fail open.
+contract ProbelessStaker {
+    function initiateMigration(address) external {}
+
+    function batchMigrate(address, address[] calldata users) external pure returns (uint256[] memory) {
+        return new uint256[](users.length);
+    }
+
+    function depositFor(address, address, uint256) external {}
+}
+
 /// @notice `CrossVersionMigrator` — the version-agnostic cross-staker migrator. Mirrors the
 ///         two-staker harness of `Migration.t.sol`, and additionally pins the behaviours that
 ///         distinguish this contract from the retired cross-staker migrator it replaced: the
@@ -125,6 +138,91 @@ contract CrossVersionMigratorTest is Test {
         new CrossVersionMigrator(
             IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(0)), owner
         );
+    }
+
+    function test_constructor_rejectsAliasedStakers() public {
+        vm.expectRevert(bytes("Migrator: aliased stakers"));
+        new CrossVersionMigrator(
+            IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(oldStaker)), owner
+        );
+    }
+
+    // ============================== DESTINATION PRE-FLIGHT ==============================
+    //
+    // `initiateMigration` is a one-way door on the SOURCE: it realizes the strategy position,
+    // decouples the strategy and latches poolState to Migrating. Every test below therefore asserts
+    // not only the revert string but that the source pool is still `Active` afterwards — i.e. that
+    // the irreversible call never happened.
+
+    function test_initiateMigration_revertsWhenDestinationTokenNotRegistered() public {
+        _stakeAliceAndBob();
+
+        // A destination that was never `addToken`ed, but IS wired — so registration is what bites.
+        StableStakerV2 unregisteredDest = new StableStakerV2(phUSD, owner);
+        CrossVersionMigrator preflight = new CrossVersionMigrator(
+            IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(unregisteredDest)), owner
+        );
+        oldStaker.setMigrator(address(preflight));
+        unregisteredDest.setMigrator(address(preflight));
+
+        vm.expectRevert(bytes("Migrator: destination token not registered"));
+        preflight.initiateMigration(address(usdc));
+
+        // the one-way door did not open
+        assertTrue(oldStaker.poolState(address(usdc)) == StableStakerV2.PoolState.Active);
+        (,,, uint256 oldTotal) = oldStaker.poolInfo(address(usdc));
+        assertEq(oldTotal, 400e6);
+    }
+
+    function test_initiateMigration_revertsWhenDestinationNotWired() public {
+        _stakeAliceAndBob();
+
+        // `newStaker` has USDC registered but still points at the setUp migrator, not this one.
+        CrossVersionMigrator unwired = new CrossVersionMigrator(
+            IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(newStaker)), owner
+        );
+        oldStaker.setMigrator(address(unwired));
+        assertEq(newStaker.migrator(), address(migrator));
+
+        vm.expectRevert(bytes("Migrator: destination not wired"));
+        unwired.initiateMigration(address(usdc));
+
+        assertTrue(oldStaker.poolState(address(usdc)) == StableStakerV2.PoolState.Active);
+        (,,, uint256 oldTotal) = oldStaker.poolInfo(address(usdc));
+        assertEq(oldTotal, 400e6);
+    }
+
+    /// @notice A destination exposing neither `migrator()` nor `getStakedTokens()` is UNVERIFIABLE,
+    ///         not wrong. Both probes fail open and the migration proceeds, so the migrator stays
+    ///         valid for staker shapes that do not exist yet (section (A)). In particular a failed
+    ///         `migrator()` probe must not masquerade as a definitive `address(0)` answer — that
+    ///         would compare unequal to the migrator and hard-revert here.
+    function test_initiateMigration_probeFailureIsAdvisoryAndPassesThrough() public {
+        _stakeAliceAndBob();
+
+        ProbelessStaker probeless = new ProbelessStaker();
+        CrossVersionMigrator advisory = new CrossVersionMigrator(
+            IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(probeless)), owner
+        );
+        oldStaker.setMigrator(address(advisory));
+
+        // sanity: the destination really does answer neither probe
+        (bool okMigrator,) = address(probeless).staticcall(abi.encodeWithSignature("migrator()"));
+        (bool okTokens,) = address(probeless).staticcall(abi.encodeWithSignature("getStakedTokens()"));
+        assertFalse(okMigrator);
+        assertFalse(okTokens);
+
+        advisory.initiateMigration(address(usdc));
+
+        assertTrue(oldStaker.poolState(address(usdc)) == StableStakerV2.PoolState.Migrating);
+    }
+
+    /// @notice The setUp harness already satisfies both preconditions, so the guards are invisible on
+    ///         the happy path.
+    function test_initiateMigration_passesPreflightOnCorrectlyWiredPair() public {
+        _stakeAliceAndBob();
+        migrator.initiateMigration(address(usdc));
+        assertTrue(oldStaker.poolState(address(usdc)) == StableStakerV2.PoolState.Migrating);
     }
 
     // ============================== HAPPY PATH ==============================

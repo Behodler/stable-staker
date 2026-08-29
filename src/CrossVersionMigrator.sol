@@ -36,6 +36,38 @@ import "./interfaces/IStableStakerMigratable.sol";
  *      targets are immutable there is no in-place retarget: a different pair of stakers is a new
  *      deployment of this contract, re-wired on both sides.
  *
+ *      {initiateMigration} is a ONE-WAY DOOR on the source staker — it realizes the strategy
+ *      position, decouples the strategy, freezes emissions and latches `poolState` to `Migrating`,
+ *      and the only way back is `finalizeAndReset` on a fully drained pool. A wiring mistake
+ *      discovered at the first {migrate} call is therefore discovered too late. Two of the three
+ *      preconditions above are consequently asserted ON CHAIN, before the forward:
+ *
+ *        - destination token registration, probed via `getStakedTokens()`
+ *          ("Migrator: destination token not registered");
+ *        - destination wiring, probed via `migrator()` ("Migrator: destination not wired").
+ *
+ *      What remains a RUNBOOK OBLIGATION, unguarded and uncheckable from here:
+ *
+ *        - phUSD minter authorization on the destination. That permission lives on the `FlaxToken`,
+ *          which this contract holds no reference to and deliberately does not import (section (A)).
+ *        - source-side `setMigrator`. The live V1 is deployed and unpatchable, and nothing this
+ *          contract can do protects against the SOURCE being mis-wired; that still fails only at
+ *          call time.
+ *        - the constructor additionally rejects `_oldStaker == _newStaker`
+ *          ("Migrator: aliased stakers"), which would otherwise freeze a staker and then attempt to
+ *          `depositFor` back into the pool it just froze.
+ *
+ *      ADVISORY ON PROBE FAILURE. Both pre-flight checks are staticcall probes on getters that are
+ *      NOT part of `IStableStakerMigratable` and must not be added to it — widening the triad would
+ *      make the frozen `IStableStakerV1` promise selectors the deployed V1 bytecode does not
+ *      dispatch. A probe that SUCCEEDS and answers "no" is a hard revert; that is the case that
+ *      actually occurs, since both V1 and V2 expose `migrator()` and `getStakedTokens()` publicly.
+ *      A probe that FAILS (reverts, or returns short/undecodable data) means the destination is a
+ *      staker shape this migrator does not recognise, NOT that the precondition is violated, and it
+ *      passes through — the same advisory posture section (F) blesses for the version probe. So the
+ *      guard is a safety net for the known shapes, never a total one, and it never costs this
+ *      contract its version-agnosticism.
+ *
  *      (D) ZERO-CREDIT USERS ARE SKIPPED, NOT PASSED THROUGH. `StableStaker.depositFor` reverts with
  *      "StableStaker: nothing credited" when the credit rounds to zero (story 011). A single dust
  *      user whose snapshot credit floors to 0 would therefore revert an entire batch. The
@@ -91,6 +123,7 @@ contract CrossVersionMigrator is Ownable {
     {
         require(address(_oldStaker) != address(0), "Migrator: zero old staker");
         require(address(_newStaker) != address(0), "Migrator: zero new staker");
+        require(address(_oldStaker) != address(_newStaker), "Migrator: aliased stakers");
         oldStaker = _oldStaker;
         newStaker = _newStaker;
     }
@@ -102,9 +135,17 @@ contract CrossVersionMigrator is Ownable {
      *         credit.
      * @dev Must be called exactly once per token BEFORE the first {migrate} batch. Reverts (on the
      *      staker) if the token is already migrating, so it is naturally idempotent-guarded.
+     *
+     *      PRE-FLIGHT. Because the forwarded call is irreversible on the source, the two
+     *      destination-side preconditions that CAN be read on chain are asserted first — see section
+     *      (C). Both are advisory when the destination does not expose the probed getter; neither
+     *      covers the phUSD-minter precondition or the source side's own `setMigrator`.
      * @param token The staked token to put into terminal migration on the old staker.
      */
     function initiateMigration(address token) external onlyOwner {
+        require(_isRegisteredOn(address(newStaker), token), "Migrator: destination token not registered");
+        (address destMigrator, bool probed) = _migratorOf(address(newStaker));
+        require(!probed || destMigrator == address(this), "Migrator: destination not wired");
         oldStaker.initiateMigration(token);
     }
 
@@ -158,5 +199,42 @@ contract CrossVersionMigrator is Ownable {
         (bool ok, bytes memory data) = staker.staticcall(abi.encodeWithSignature("STAKER_VERSION()"));
         if (!ok || data.length < 32) return 1;
         return abi.decode(data, (uint256));
+    }
+
+    /**
+     * @dev Probes `migrator()` on `staker` without widening `IStableStakerMigratable` — the same
+     *      shape as {_versionOf}. Public on both V1 (`StableStakerV1.sol`) and V2.
+     * @return destMigrator The address the staker currently recognises as its migrator. Meaningless
+     *         unless `probed` is true.
+     * @return probed True when the getter answered. FALSE MUST NOT BE READ AS A NEGATIVE ANSWER:
+     *         `address(0)` from a failed probe compares unequal to `address(this)` and would
+     *         hard-revert an unrecognised-but-valid destination, which is precisely the
+     *         version-agnosticism section (A) protects. The caller gates on `probed` first.
+     */
+    function _migratorOf(address staker) internal view returns (address destMigrator, bool probed) {
+        (bool ok, bytes memory data) = staker.staticcall(abi.encodeWithSignature("migrator()"));
+        if (!ok || data.length < 32) return (address(0), false);
+        return (abi.decode(data, (address)), true);
+    }
+
+    /**
+     * @dev Probes `getStakedTokens()` on `staker` and scans the result for `token`. Public on both
+     *      V1 and V2, and the only HONEST registration probe: `poolInfo` returns all zeros for an
+     *      unregistered token (its `lastRewardTime != 0` tell is an undocumented coincidence of
+     *      `addToken`), and `poolState` reads `Active` for one because `Active` is the zero value.
+     *
+     *      The scan is O(n) over an externally-controlled array, but the registered-token set is
+     *      single-digit and this is an owner-only call made once per token.
+     * @return True when the token is registered, OR when the probe itself failed — an unrecognised
+     *         destination shape is "unverifiable", not "wrong". See the advisory note in section (C).
+     */
+    function _isRegisteredOn(address staker, address token) internal view returns (bool) {
+        (bool ok, bytes memory data) = staker.staticcall(abi.encodeWithSignature("getStakedTokens()"));
+        if (!ok || data.length < 64) return true;
+        address[] memory tokens = abi.decode(data, (address[]));
+        for (uint256 i = 0; i < tokens.length; i++) {
+            if (tokens[i] == token) return true;
+        }
+        return false;
     }
 }
