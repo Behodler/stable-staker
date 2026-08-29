@@ -21,10 +21,10 @@ there is no recovery.
 
 ### Why a hook, when the compiler already enforces it
 
-`StableStaker.sol` declares `is IStableStaker`, so deleting one of the three from the contract
+`StableStakerV2.sol` declares `is IStableStaker`, so deleting one of the three from the contract
 fails the build (story 014). This hook guards the layer the compiler cannot: an agent "fixing"
-that build error by deleting the declaration from `IStableStakerMigratable` as well, or from a
-frozen `src/versions/` snapshot. At that point everything compiles again and the rule is gone.
+that build error by deleting the declaration from `IStableStakerMigratable` as well, or from the
+frozen `src/versions/v1/` copy. At that point everything compiles again and the rule is gone.
 
 ### Triggers
 
@@ -166,6 +166,9 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git commit -m drop"}}' \
 .github/scripts/check-migration-surface.sh   # exit 0 when the surface is intact
 ```
 
-It asserts three things: `src/interfaces/IStableStakerMigratable.sol` declares all three,
-`src/StableStaker.sol` declares all three, and every `src/versions/IStableStakerV*.sol` still
-reads `is IStableStakerMigratable`.
+It asserts four things: `src/interfaces/IStableStakerMigratable.sol` declares all three,
+`src/StableStakerV2.sol` (the evergreen implementation) declares all three, every
+`src/versions/v*/IStableStakerV*.sol` still reads `is IStableStakerMigratable`, and the frozen
+V1 files under `src/versions/v1/` still exist and still hash to the values pinned in
+`src/versions/v1/FROZEN.sha256` (story 019, closing audit finding `ss14l3` / `L-03` — the gate
+used to catch mutation of the migration surface but treated a *deleted* snapshot as a note).
