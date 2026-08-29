@@ -88,6 +88,13 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     /// @notice token => enumerable set of addresses currently holding a non-zero position.
     mapping(address => EnumerableSet.AddressSet) private _stakers;
 
+    /// @notice token => user => settled-but-unminted phUSD reward, claimable via {claim}.
+    /// @dev Written only by {_settle}, {withdraw} and the terminal-migration exit; drained to zero by
+    ///      {claim}, {emergencyWithdraw} (forfeit) and {_exitPosition} (paid out). A standalone mapping
+    ///      rather than a third {UserInfo} field, so the public `userInfo` getter keeps its 2-tuple
+    ///      arity and {IStableStaker} needs no change.
+    mapping(address => mapping(address => uint256)) public unclaimedReward;
+
     /// @notice Set of every registered pool token.
     EnumerableSet.AddressSet private _registeredTokens;
 
@@ -309,7 +316,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
     // ============================== STAKING ==============================
 
-    /// @notice Stake `amount` of `token`. Any pending reward is minted to the caller first.
+    /// @notice Stake `amount` of `token`. Any pending reward is booked to {unclaimedReward} first;
+    ///         nothing is minted here. Claim it with {claim}.
     function stake(address token, uint256 amount) external nonReentrant whenNotPaused poolExists(token) {
         require(amount > 0, "StableStaker: amount=0");
         // Frozen once terminal migration is engaged: new stake would pollute the immutable `P`
@@ -318,7 +326,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage user = userInfo[token][msg.sender];
-        _settle(msg.sender, user, pool);
+        _settle(token, msg.sender, user, pool);
 
         uint256 received = _pullToken(token, msg.sender, amount);
         uint256 credited = _routeDeposit(token, received);
@@ -330,7 +338,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         emit Staked(token, msg.sender, credited);
     }
 
-    /// @notice Withdraw `amount` of staked `token`. Any pending reward is minted to the caller.
+    /// @notice Withdraw `amount` of staked `token`. Any pending reward is booked to {unclaimedReward}
+    ///         rather than minted, so principal handling never depends on phUSD being mintable.
     function withdraw(address token, uint256 amount) external nonReentrant whenNotPaused poolExists(token) {
         require(amount > 0, "StableStaker: amount=0");
         // Frozen once terminal migration is engaged: exits go through {userMigrate}, which honours the
@@ -350,7 +359,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         }
 
         if (pending > 0) {
-            phUSD.mint(msg.sender, pending);
+            unclaimedReward[token][msg.sender] += pending;
         }
         // Non-migrating withdrawals are blocked while the strategy is below par (avoids realising
         // a loss on a user who did not opt into migration). Forward the measured-received amount.
@@ -359,22 +368,28 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         emit Withdrawn(token, msg.sender, amount);
     }
 
-    /// @notice Mint the caller's pending phUSD reward for `token` without touching principal.
+    /// @notice Mint the caller's phUSD reward for `token` without touching principal: the
+    ///         settled-but-unminted {unclaimedReward} backlog plus anything freshly pending. This is
+    ///         the only user-facing path that mints, and {claimableReward} reads the figure it pays.
+    /// @dev Succeeds for a caller with no position but a non-zero backlog (someone who fully withdrew
+    ///      and has not claimed yet). Still `whenNotPaused`, so a pause withholds the backlog too.
     function claim(address token) external nonReentrant whenNotPaused poolExists(token) {
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage user = userInfo[token][msg.sender];
         uint256 pending = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION - user.rewardDebt;
-        require(pending > 0, "StableStaker: nothing to claim");
+        uint256 owed = unclaimedReward[token][msg.sender] + pending;
+        require(owed > 0, "StableStaker: nothing to claim");
+        unclaimedReward[token][msg.sender] = 0;
         user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
-        phUSD.mint(msg.sender, pending);
-        emit Claimed(token, msg.sender, pending);
+        phUSD.mint(msg.sender, owed);
+        emit Claimed(token, msg.sender, owed);
     }
 
     /**
-     * @notice Escape hatch: withdraw the caller's full principal for `token`, forfeiting any
-     *         pending reward. Works while paused and never touches reward accounting, so a
-     *         broken mint path can never trap principal.
+     * @notice Escape hatch: withdraw the caller's full principal for `token`, forfeiting ALL reward —
+     *         the live pending AND the settled-but-unminted {unclaimedReward} backlog. Works while
+     *         paused and never mints, so a broken mint path can never trap principal.
      */
     function emergencyWithdraw(address token) external nonReentrant {
         // Frozen once terminal migration is engaged: the escape hatch becomes {userMigrate}, which
@@ -385,6 +400,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         require(amount > 0, "StableStaker: nothing staked");
         user.amount = 0;
         user.rewardDebt = 0;
+        // Forfeit the backlog too: the hatch stays the single rule "no reward, principal out".
+        unclaimedReward[token][msg.sender] = 0;
         poolInfo[token].totalStaked -= amount;
         _stakers[token].remove(msg.sender);
         // No underwater guard: the escape hatch must always work, accepting a haircut if below par.
@@ -569,7 +586,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     }
 
     /**
-     * @dev Shared terminal-migration exit for one user: mints their frozen pending phUSD, computes the
+     * @dev Shared terminal-migration exit for one user: mints their frozen pending phUSD PLUS any
+     *      {unclaimedReward} backlog (terminal exit settles everything owed), computes the
      *      snapshot credit `p_i·min(R,P)/P`, zeroes their position and removes them from the staker set.
      *      Returns the credit (0 for an empty position). Used by both {batchMigrate} and {userMigrate},
      *      so a self-migrated user and a batch-migrated user with equal principal get identical credit.
@@ -590,15 +608,18 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         PoolInfo storage pool = poolInfo[token];
         uint256 pending = (amt * pool.accPhusdPerShare) / ACC_PRECISION - info.rewardDebt;
 
+        uint256 owed = unclaimedReward[token][account] + pending;
+
         info.amount = 0;
         info.rewardDebt = 0;
+        unclaimedReward[token][account] = 0;
         pool.totalStaked -= amt;
         _stakers[token].remove(account);
 
-        if (pending > 0) {
-            phUSD.mint(account, pending);
+        if (owed > 0) {
+            phUSD.mint(account, owed);
         }
-        emit MigratedOut(token, account, credit, pending);
+        emit MigratedOut(token, account, credit, owed);
     }
 
     /**
@@ -685,7 +706,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage info = userInfo[token][user];
-        _settle(user, info, pool);
+        _settle(token, user, info, pool);
 
         uint256 received = _pullToken(token, msg.sender, amount);
         uint256 credited = _routeDeposit(token, received);
@@ -699,10 +720,29 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
     // ============================== VIEWS ==============================
 
-    /// @notice Projected pending phUSD reward for `account` in `token`'s pool.
-    /// @dev While terminal migration is active, emissions are frozen at the snapshot, so this returns
-    ///      the fixed pending (no forward projection) — matching what the migration exit mints.
+    /// @notice Projected pending phUSD reward for `account` in `token`'s pool — the LIVE PROJECTION
+    ///         ONLY, measured against `rewardDebt`.
+    /// @dev Deliberately EXCLUDES the settled-but-unminted {unclaimedReward} backlog, so its meaning is
+    ///      byte-identical to the frozen V1 function of the same name (V1 is permanently deployed and
+    ///      this project ships a cross-version migrator, so both are read side by side). For the figure
+    ///      {claim} and the terminal-migration exit actually pay, read {claimableReward}. While terminal
+    ///      migration is active, emissions are frozen at the snapshot, so this returns the fixed pending
+    ///      with no forward projection.
     function pendingReward(address token, address account) external view returns (uint256) {
+        return _pendingReward(token, account);
+    }
+
+    /// @notice Total phUSD `account` could mint from `token`'s pool right now: the settled-but-unminted
+    ///         {unclaimedReward} backlog plus the live projection returned by {pendingReward}.
+    /// @dev This is the figure {claim} pays. {pendingReward} deliberately excludes the backlog so its
+    ///      meaning stays identical to the frozen V1 function of the same name.
+    function claimableReward(address token, address account) external view returns (uint256) {
+        return unclaimedReward[token][account] + _pendingReward(token, account);
+    }
+
+    /// @dev Pure extraction of the former {pendingReward} body, shared with {claimableReward}. Returns
+    ///      the identical value {pendingReward} always returned, for every input.
+    function _pendingReward(address token, address account) internal view returns (uint256) {
         PoolInfo storage pool = poolInfo[token];
         uint256 acc = pool.accPhusdPerShare;
         if (poolState[token] == PoolState.Active && block.timestamp > pool.lastRewardTime && pool.totalStaked > 0) {
@@ -786,12 +826,14 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         pool.lastRewardTime = block.timestamp;
     }
 
-    /// @dev Mint any outstanding pending reward for an existing position. Assumes pool is current.
-    function _settle(address account, UserInfo storage user, PoolInfo storage pool) internal {
+    /// @dev Book any outstanding pending reward for an existing position to {unclaimedReward}, where
+    ///      {claim} will mint it. Never calls phUSD, so a revoked minter role cannot brick the
+    ///      principal paths that reach here. Assumes pool is current.
+    function _settle(address token, address account, UserInfo storage user, PoolInfo storage pool) internal {
         if (user.amount > 0) {
             uint256 pending = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION - user.rewardDebt;
             if (pending > 0) {
-                phUSD.mint(account, pending);
+                unclaimedReward[token][account] += pending;
             }
         }
     }

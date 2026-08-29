@@ -124,8 +124,12 @@ contract MigrationTest is Test {
         assertEq(usdc.balanceOf(address(oldStaker)), 0);
 
         // --- earned rewards minted to the users during batchMigrate (same block => exact) ---
+        // Story 022: the exit pays pending + any `unclaimedReward` backlog. Neither user booked one
+        // here, so the figures are unchanged, and the backlog is zero on the way out either way.
         assertEq(phUSD.balanceOf(alice), pendingAlice);
         assertEq(phUSD.balanceOf(bob), pendingBob);
+        assertEq(oldStaker.unclaimedReward(address(usdc), alice), 0);
+        assertEq(oldStaker.unclaimedReward(address(usdc), bob), 0);
 
         // --- v2 credited with original principal ---
         (uint256 aNew,) = newStaker.userInfo(address(usdc), alice);
@@ -516,6 +520,8 @@ contract MigrationTest is Test {
         // Pending minted in full (frozen value), independent of the 10% principal haircut.
         assertEq(phUSD.balanceOf(alice), pendingAlice);
         assertEq(phUSD.balanceOf(bob), pendingBob);
+        assertEq(oldStaker.unclaimedReward(address(usdc), alice), 0);
+        assertEq(oldStaker.unclaimedReward(address(usdc), bob), 0);
     }
 
     // ============================== NO-STRATEGY POOL ==============================
@@ -660,7 +666,8 @@ contract MigrationTest is Test {
         vm.prank(alice);
         oldStaker.userMigrate(address(usdc));
         assertEq(usdc.balanceOf(alice) - aliceBalBefore, 90e6); // 0.9 * 100e6
-        assertEq(phUSD.balanceOf(alice), pendingAlice); // frozen pending minted
+        assertEq(phUSD.balanceOf(alice), pendingAlice); // frozen pending minted (no backlog booked)
+        assertEq(oldStaker.unclaimedReward(address(usdc), alice), 0);
 
         address[] memory justBob = new address[](1);
         justBob[0] = bob;

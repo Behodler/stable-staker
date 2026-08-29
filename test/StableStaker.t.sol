@@ -85,17 +85,25 @@ contract StableStakerTest is Test {
         assertEq(staker.pendingReward(address(usdc), alice), 0);
     }
 
-    function test_withdraw_returnsPrincipalAndMintsReward() public {
+    function test_withdraw_returnsPrincipalAndBooksReward() public {
         _stake(alice, address(usdc), 100e6);
         vm.warp(block.timestamp + 100);
         uint256 balBefore = usdc.balanceOf(alice);
         vm.prank(alice);
         staker.withdraw(address(usdc), 40e6);
         assertEq(usdc.balanceOf(alice), balBefore + 40e6);
-        assertEq(phUSD.balanceOf(alice), 100 ether); // reward settled on withdraw
+        // Story 022: withdraw settles the reward but no longer mints it — it is booked to
+        // `unclaimedReward` and paid by `claim`.
+        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
+        assertEq(staker.claimableReward(address(usdc), alice), 100 ether);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 60e6);
         assertEq(staker.pendingReward(address(usdc), alice), 0);
+        // The reward is still fully payable, on the explicit claim.
+        vm.prank(alice);
+        staker.claim(address(usdc));
+        assertEq(phUSD.balanceOf(alice), 100 ether);
     }
 
     function test_fullWithdraw_removesFromSet() public {
@@ -230,6 +238,9 @@ contract StableStakerTest is Test {
         staker.emergencyWithdraw(address(usdc));
         assertEq(usdc.balanceOf(alice), balBefore + 100e6);
         assertEq(phUSD.balanceOf(alice), 0); // reward forfeited
+        // Story 022: the backlog is forfeited too, so nothing is left to claim afterwards.
+        assertEq(staker.unclaimedReward(address(usdc), alice), 0);
+        assertEq(staker.claimableReward(address(usdc), alice), 0);
         assertEq(staker.stakerCount(address(usdc)), 0);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 0);

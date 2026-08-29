@@ -73,7 +73,9 @@ contract YieldStrategyIntegrationTest is Test {
         vm.prank(alice);
         staker.withdraw(address(usdc), 40e6);
         assertEq(usdc.balanceOf(alice), balBefore + 40e6);
-        assertEq(phUSD.balanceOf(alice), 100 ether);
+        // Story 022: booked, not minted, on withdraw.
+        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 60e6);
     }
@@ -169,7 +171,9 @@ contract YieldStrategyIntegrationTest is Test {
         staker.withdraw(address(usdc), 40e6);
 
         assertEq(usdc.balanceOf(alice), balBefore + 40e6);
-        assertEq(phUSD.balanceOf(alice), 100 ether); // identical reward math
+        // Story 022: identical reward math, booked to `unclaimedReward` instead of minted.
+        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 60e6);
         assertEq(strategy.principalOf(address(usdc), address(staker)), 60e6);
@@ -477,6 +481,7 @@ contract YieldStrategyIntegrationTest is Test {
 
         assertEq(usdc.balanceOf(alice), balBefore + 90e6); // 10% haircut
         assertEq(phUSD.balanceOf(alice), 0); // reward forfeited
+        assertEq(staker.unclaimedReward(address(usdc), alice), 0); // story 022: backlog forfeited too
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 0);
         assertEq(staker.stakerCount(address(usdc)), 0);

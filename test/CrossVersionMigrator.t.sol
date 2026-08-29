@@ -258,9 +258,12 @@ contract CrossVersionMigratorTest is Test {
         assertEq(newTotal, 400e6);
         assertEq(usdc.balanceOf(address(newStaker)), 400e6);
 
-        // earned phUSD was minted to the users on the way out
+        // earned phUSD was minted to the users on the way out (story 022: pending + any
+        // `unclaimedReward` backlog; neither user booked one here)
         assertEq(phUSD.balanceOf(alice), pendingAlice);
         assertEq(phUSD.balanceOf(bob), pendingBob);
+        assertEq(oldStaker.unclaimedReward(address(usdc), alice), 0);
+        assertEq(oldStaker.unclaimedReward(address(usdc), bob), 0);
 
         // nothing stranded in the migrator
         assertEq(usdc.balanceOf(address(migrator)), 0);

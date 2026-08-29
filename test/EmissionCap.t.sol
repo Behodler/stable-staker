@@ -121,9 +121,28 @@ contract EmissionCapTest is Test {
             staker.withdraw(address(usdc), 10e6); // and pulling out
         }
 
+        // One final window that is settled but NOT claimed, so a real backlog is outstanding when the
+        // cap is measured. Story 022: `stake` books alice's pending instead of minting it.
+        vm.warp(block.timestamp + 6 hours);
+        _stake(alice, 1e6);
+
         uint256 elapsed = block.timestamp - startTime;
         uint256 minted = phUSD.totalSupply() - startMinted;
         uint256 cap = elapsed * (PER_DAY / 1 days); // perSecond * elapsed
         assertLe(minted, cap);
+
+        // Story 022 companion: minted alone now UNDERSTATES what was accrued, because withdraw books
+        // to `unclaimedReward` instead of minting. The statement that carries the invariant is
+        // sum(unclaimed) + minted <= cap — the cap holds a fortiori once payout is deferred.
+        uint256 unclaimed = staker.unclaimedReward(address(usdc), alice) + staker.unclaimedReward(address(usdc), bob);
+        assertGt(unclaimed, 0, "the churn really did book a backlog");
+        assertLe(unclaimed + minted, cap, "accrued (minted + booked) never exceeds the emission cap");
+
+        // And draining the whole backlog to phUSD still respects the cap. Bob exited fully inside the
+        // loop and claimed each round, so alice holds all of it.
+        assertEq(staker.unclaimedReward(address(usdc), bob), 0);
+        _claim(alice);
+        assertEq(staker.unclaimedReward(address(usdc), alice), 0);
+        assertLe(phUSD.totalSupply() - startMinted, cap);
     }
 }

@@ -109,9 +109,11 @@ contract InPlaceMigratorTest is Test {
         migrator.initiateMigration(address(usdc));
         migrator.migrateOut(address(usdc), _users());
 
-        // Earned phUSD already minted to users at migrateOut.
+        // Earned phUSD already minted to users at migrateOut (story 022: pending + backlog).
         assertEq(phUSD.balanceOf(alice), pendingAlice);
         assertEq(phUSD.balanceOf(bob), pendingBob);
+        assertEq(staker.unclaimedReward(address(usdc), alice), 0);
+        assertEq(staker.unclaimedReward(address(usdc), bob), 0);
 
         // REWIRE: reset the SAME pool, wire a fresh V2 strategy on the now-empty pool.
         staker.finalizeAndReset(address(usdc));
