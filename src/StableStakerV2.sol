@@ -146,6 +146,21 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
     event PoolReset(address indexed token);
 
+    /// @notice Emitted once by EVERY initiateMigration, including a clean one. `claimed` is the pool's
+    ///         totalStaked snapshot P; `booked` is strategy.principalOf after the full exit;
+    ///         `relinquished` is what was written down. `booked == 0` is the clean case and is
+    ///         reported explicitly - the absence of this log means the migration did not happen, not
+    ///         that it happened cleanly. A non-zero `booked` means something moved principal without
+    ///         the pool's accounting following it; see setYieldStrategy's idle sweep for the known cause.
+    event PrincipalDivergence(address indexed token, uint256 claimed, uint256 booked, uint256 relinquished);
+
+    /// @notice Emitted when setYieldStrategy sweeps idle (non-user) balance into a newly wired strategy.
+    ///         The pool is empty at this point by the totalStaked == 0 gate, so `amount` is protocol
+    ///         money by construction: set-aside buffer, dust, and donations. Pairs with
+    ///         PrincipalDivergence - an observer subtracting the swept history from a later divergence
+    ///         is left with the UNEXPLAINED part, which is the number worth alerting on.
+    event ProtocolPrincipalSwept(address indexed token, address indexed strategy, uint256 amount, uint256 credited);
+
     // ============================== MODIFIERS ==============================
 
     modifier onlyPauser() {
@@ -271,7 +286,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
             // accounting is consistent immediately (at first adoption this equals staked principal).
             uint256 idleBalance = IERC20(token).balanceOf(address(this));
             if (idleBalance > 0) {
-                strategy.deposit(token, idleBalance, address(this));
+                uint256 credited = strategy.deposit(token, idleBalance, address(this));
+                emit ProtocolPrincipalSwept(token, address(strategy), idleBalance, credited);
             }
         }
 
@@ -447,12 +463,36 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         // appearing in IYieldStrategy: it is onlyOwner (this contract is only a client), two-phase with
         // a 24h delay (no atomic realization), and redeems to the strategy *owner*, not this client —
         // so the funds would never land here. withdraw caps the request to available principal, draining
-        // the client fully. When no strategy is set, _routeExit returns P (principal already idle ⇒ R = P).
-        uint256 R = _routeExit(token, P, false);
+        // the client fully. When no strategy is set, _routeExit is a no-op (principal already idle).
+        // The return value is deliberately NOT used: R is measured from this contract's own balance
+        // below, so the set-aside buffer counts toward the migration payout.
+        _routeExit(token, P, false);
 
-        // Post-check the exit fully drained the client (a tranche/queue vault that can only exit
-        // partially would understate R and strand value — terminal mode gives no retry). Skipped when
-        // no strategy is set.
+        // Write down anything the strategy still books to us. setYieldStrategy's idle sweep can leave
+        // principalOf > totalStaked — that excess is protocol money by construction (the sweep is gated
+        // on an empty pool) and is relinquished here rather than bricking the migration, which is
+        // audit-14 ss14m1. relinquishPrincipal is onlyAuthorizedClient, so this contract may call it on
+        // its own behalf; it already does so on the underwater buffer path. The write-down touches
+        // recorded principal only — no vault shares move — so the value stays in the strategy as
+        // protocol-owned capital.
+        uint256 booked = address(strategy) == address(0) ? 0 : strategy.principalOf(token, address(this));
+
+        // Emitted on EVERY migration, a clean one included (booked == 0), so a missing log is itself a
+        // signal rather than being indistinguishable from a migration that reconciled nothing.
+        // Deliberately BEFORE the booked > 0 guard, never inside it.
+        emit PrincipalDivergence(token, P, booked, booked);
+
+        // The GUARD is on the call, not on the event: AYieldStrategy._relinquishInternal reverts on a
+        // zero amount (twice — before and after capping), so an unguarded call would turn a clean
+        // migration into a reverting one, which is precisely the failure this change removes.
+        if (booked > 0) {
+            strategy.relinquishPrincipal(token, booked);
+        }
+
+        // Post-check the exit fully drained the client. Now satisfiable by construction rather than
+        // being the brick: it still catches a strategy whose relinquish does not actually write the
+        // principal down (a tranche/queue vault that cannot exit atomically). Skipped when no strategy
+        // is set.
         require(
             address(strategy) == address(0) || strategy.principalOf(token, address(this)) == 0,
             "StableStaker: incomplete exit"
@@ -469,10 +509,20 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         // is meaningful only while Migrating and is zeroed by {finalizeAndReset} on revival.
         poolState[token] = PoolState.Migrating;
 
-        // Surplus is NOT swept. withdraw caps payout at par, so R ≤ P structurally; any above-par yield
-        // stays inside the now-decoupled strategy as protocol-owned value and never reaches users (the
-        // "stakers get principal + phUSD only" invariant holds). min(R, P) below is therefore == R in
-        // practice but defends against a stray above-par R (e.g. a donation) by capping credits at par.
+        // R is the whole liquid position this contract can pay migration credits from, capped at par.
+        // Measuring it from the balance (rather than from _routeExit's delta) counts the set-aside
+        // buffer, dust and donations already sitting here, so a below-par exit is softened before any
+        // user is haircut — audit-14 ss14l8. All liquid value up to par is paid to users; anything
+        // above par stays protocol-owned in the now-decoupled strategy, so the "stakers get principal
+        // + phUSD only" invariant holds. Computed after the reconciliation block so the code reads in
+        // the order the reasoning runs (relinquishPrincipal moves no tokens, so it cannot affect this
+        // balance either way). min(R, P) at the credit site is now redundant but is kept as cheap
+        // defence against a stray donation arriving between here and the last userMigrate.
+        uint256 R = IERC20(token).balanceOf(address(this));
+        if (R > P) {
+            R = P;
+        }
+
         migrationInfo[token] = MigrationInfo({realized: R, principalSnapshot: P});
         emit MigrationInitiated(token, R, P);
     }

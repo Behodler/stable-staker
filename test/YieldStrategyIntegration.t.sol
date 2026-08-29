@@ -25,6 +25,8 @@ contract YieldStrategyIntegrationTest is Test {
 
     event YieldStrategySet(address indexed token, address indexed oldStrategy, address indexed newStrategy);
     event BufferWithdrawn(address indexed token, address indexed user, uint256 amount);
+    /// @dev Mirrors {StableStakerV2.ProtocolPrincipalSwept} for vm.expectEmit.
+    event ProtocolPrincipalSwept(address indexed token, address indexed strategy, uint256 amount, uint256 credited);
 
     function setUp() public {
         phUSD = new FlaxToken();
@@ -815,5 +817,37 @@ contract YieldStrategyIntegrationTest is Test {
         // Idle dust (the donation) is swept into the strategy by the sweep-on-wire logic.
         assertEq(strategy.principalOf(address(usdc), address(staker)), 1e6);
         assertEq(usdc.balanceOf(address(staker)), 0);
+    }
+
+    /// @dev The sweep-on-wire reports itself. `amount` is the full idle balance pulled in; `credited`
+    ///      is what the strategy actually booked, which a haircutting strategy reports as strictly
+    ///      less. Capturing the previously-discarded deposit return (ledger entry dab5a656) is what
+    ///      makes the two numbers separable off chain: an observer subtracts the swept history from a
+    ///      later PrincipalDivergence.booked and is left with the UNEXPLAINED part.
+    function test_setYieldStrategy_emitsProtocolPrincipalSwept_creditedBelowAmount() public {
+        // Protocol money parked on the still-empty pool: buffer, dust, donations.
+        usdc.mint(address(staker), 100e6);
+        // 2% deposit slippage: the strategy pulls 100e6 but books only 98e6 as principal.
+        strategy.setDepositSlippageBps(200);
+
+        vm.expectEmit(true, true, false, true, address(staker));
+        emit ProtocolPrincipalSwept(address(usdc), address(strategy), 100e6, 98e6);
+        _setStrategy();
+
+        // The sweep behaviour itself is unchanged: the full idle balance still moves.
+        assertEq(usdc.balanceOf(address(staker)), 0);
+        assertEq(usdc.balanceOf(address(strategy)), 100e6);
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 98e6);
+    }
+
+    /// @dev With no slippage `credited == amount`, and the event still fires.
+    function test_setYieldStrategy_emitsProtocolPrincipalSwept_fullCredit() public {
+        usdc.mint(address(staker), 42e6);
+
+        vm.expectEmit(true, true, false, true, address(staker));
+        emit ProtocolPrincipalSwept(address(usdc), address(strategy), 42e6, 42e6);
+        _setStrategy();
+
+        assertEq(strategy.principalOf(address(usdc), address(staker)), 42e6);
     }
 }

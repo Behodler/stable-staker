@@ -181,3 +181,50 @@ Two consequences that are load-bearing:
 
 `StableStakerV2` (`STAKER_VERSION == 2`) is the current evergreen and is **not yet deployed**;
 it gets a `v2/` directory at its deploy, following the ritual above.
+
+## V1 RECOVERY — clearing a stuck `initiateMigration` on the deployed V1
+
+`StableStakerV2.initiateMigration` self-heals a strategy principal divergence: it relinquishes
+whatever the strategy still books against the staker after the exit, emits `PrincipalDivergence`,
+and continues. **The frozen V1 does not**, and cannot — its bytecode is on chain at
+`0xbce8ABC09BaEDCabE93419bF875f6186e182079A` and cannot be patched. An operator calling
+`initiateMigration` on V1 may therefore still hit:
+
+```
+StableStaker: incomplete exit
+```
+
+The cause is `setYieldStrategy`'s idle sweep. It deposits the contract's whole idle balance into a
+newly wired strategy — set-aside buffer, dust, donations, all protocol money by construction,
+since the wiring is gated on an empty pool — without `poolInfo[token].totalStaked` ever learning
+about it. `initiateMigration` then withdraws exactly `totalStaked` and asserts the strategy books
+nothing further, which it cannot satisfy while that excess is still on the strategy's books.
+
+### The clear
+
+Compute the surplus and write it down **on the strategy**, as the strategy's owner:
+
+```
+surplus = strategy.principalOf(token, staker) - staker.poolInfo(token).totalStaked
+strategy.relinquishPrincipalAsOwner(staker, surplus)
+```
+
+Then re-run `initiateMigration` on the staker.
+
+Four things to get right:
+
+- **The call is on the STRATEGY, not on the staker.** `relinquishPrincipalAsOwner` lives on
+  `AYieldStrategy` in `reflax-yield-vault` and is `onlyOwner` *of the strategy*. Nothing is called
+  on `StableStaker` to clear this.
+- **Never round the surplus up.** Relinquishing more than the divergence writes down principal the
+  pool genuinely claims, and the shortfall is then haircut across every migrating user. Compute the
+  exact difference; if the two reads cannot be taken atomically, take them in the same block.
+- **`relinquishPrincipalAsOwner` is the correct call, not `withdrawAsOwner`.** Both clear the books.
+  `withdrawAsOwner` also moves the tokens out to the owner, so the value leaves the position;
+  `relinquishPrincipalAsOwner` touches recorded principal only — no vault shares move — and the
+  relinquished value stays in the strategy as protocol-owned capital, returning through the yield
+  accumulator.
+- **This is a prerequisite for shipping the V2 fix, not an alternative to it.** `StableStaker` is a
+  plain `Ownable` with no proxy, so the self-heal only reaches chain in a newly deployed staker —
+  and reaching a new staker requires `initiateMigration` on the old one. DOLA and USDC on the live
+  V1 are both in this state and must be cleared this way first.

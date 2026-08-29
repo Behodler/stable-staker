@@ -27,6 +27,9 @@ contract MigrationTest is Test {
 
     uint256 internal constant PER_DAY = 86_400 ether; // 1e18 / second
 
+    /// @dev Mirrors {StableStakerV2.PrincipalDivergence} for vm.expectEmit.
+    event PrincipalDivergence(address indexed token, uint256 claimed, uint256 booked, uint256 relinquished);
+
     function setUp() public {
         phUSD = new FlaxToken();
         oldStaker = new StableStakerV2(phUSD, owner);
@@ -536,8 +539,13 @@ contract MigrationTest is Test {
 
     // ============================== POST-CHECK GUARD (incomplete exit) ==============================
 
-    // A strategy that cannot fully exit (leaves principalOf > 0) makes initiateMigration revert on the
-    // post-check. UnderRealizingStrategy caps withdraw to only part of principal per call.
+    // The post-check survives the ss14m1 self-heal, and this test now proves what is left of it: a
+    // strategy whose relinquishPrincipal does not actually write the principal down still trips the
+    // revert. UnderRealizingStrategy realizes only half the requested principal per withdraw AND
+    // stubs relinquishPrincipal as a no-op, so the reconciliation cannot clear the residual and
+    // "StableStaker: incomplete exit" fires. The self-heal removed the brick for the KNOWN divergence
+    // (setYieldStrategy's idle sweep, which a real relinquish clears); it did not remove the guard
+    // against a strategy that cannot honestly exit. Do not make the stub functional.
     function test_postCheck_incompleteExitReverts() public {
         // Wire the under-realizing strategy on the EMPTY pool first, then stake.
         UnderRealizingStrategy strat = new UnderRealizingStrategy();
@@ -793,6 +801,113 @@ contract MigrationTest is Test {
         assertEq(usdc.balanceOf(carol) - carolBefore, 250e6);
         (,,, uint256 totalAfter) = oldStaker.poolInfo(address(usdc));
         assertEq(totalAfter, 0);
+    }
+
+    // ================= SELF-HEAL: SWEPT PRINCIPAL DIVERGENCE (audit-14 ss14m1 / ss14l8) =================
+
+    /// @dev Reproduces ss14m1. {StableStakerV2.setYieldStrategy}'s idle sweep books protocol money
+    ///      (buffer, dust, donations) against this contract, so `strategy.principalOf` ends up ABOVE
+    ///      `poolInfo.totalStaked`. Before the self-heal, initiateMigration reverted with
+    ///      "StableStaker: incomplete exit" and terminal migration was permanently bricked. It must
+    ///      now relinquish the excess and succeed.
+    function test_initiate_selfHealsSweptDivergence() public {
+        // Donation / set-aside buffer sitting idle while the pool is still EMPTY.
+        usdc.mint(address(oldStaker), 50e6);
+
+        MockYieldStrategy strategy = new MockYieldStrategy();
+        strategy.setClient(address(oldStaker), true);
+        // The sweep books the 50e6 as staker principal; totalStaked stays 0.
+        oldStaker.setYieldStrategy(address(usdc), IYieldStrategy(address(strategy)));
+        assertEq(strategy.principalOf(address(usdc), address(oldStaker)), 50e6);
+
+        _stakeAliceAndBob(); // P = 400e6 but principalOf = 450e6 => 50e6 divergence
+
+        (,,, uint256 P) = oldStaker.poolInfo(address(usdc));
+        assertEq(P, 400e6);
+        assertEq(strategy.principalOf(address(usdc), address(oldStaker)), 450e6);
+
+        vm.expectEmit(true, false, false, true, address(oldStaker));
+        emit PrincipalDivergence(address(usdc), 400e6, 50e6, 50e6);
+        migrator.initiateMigration(address(usdc));
+
+        // The strategy no longer books anything against the staker: the post-check passed.
+        assertEq(strategy.principalOf(address(usdc), address(oldStaker)), 0);
+        (uint256 R, uint256 snapshot) = oldStaker.migrationInfo(address(usdc));
+        assertEq(snapshot, 400e6);
+        assertEq(R, 400e6);
+    }
+
+    /// @dev PrincipalDivergence fires on a CLEAN migration too (booked == 0). Absence of the log must
+    ///      mean "the migration did not happen", never "it happened and reconciled nothing".
+    function test_initiate_principalDivergence_emittedOnCleanMigration() public {
+        MockYieldStrategy strategy = _routeOldThroughStrategy(); // principalOf == totalStaked
+
+        vm.expectEmit(true, false, false, true, address(oldStaker));
+        emit PrincipalDivergence(address(usdc), 400e6, 0, 0);
+        migrator.initiateMigration(address(usdc));
+
+        assertEq(strategy.principalOf(address(usdc), address(oldStaker)), 0);
+    }
+
+    /// @dev With NO strategy wired there is nothing to read or relinquish; the short-circuit must hold
+    ///      (calling into address(0) would revert) and the event still fires with booked == 0.
+    function test_initiate_principalDivergence_emittedWithNoStrategy() public {
+        _stakeAliceAndBob();
+        assertEq(address(oldStaker.yieldStrategy(address(usdc))), address(0));
+
+        vm.expectEmit(true, false, false, true, address(oldStaker));
+        emit PrincipalDivergence(address(usdc), 400e6, 0, 0);
+        migrator.initiateMigration(address(usdc));
+
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertEq(R, 400e6);
+        assertEq(P, 400e6);
+    }
+
+    /// @dev ss14l8: R is measured from this contract's own balance, so idle set-aside buffer counts
+    ///      toward the migration payout. A 5% underwater strategy delivers only 380e6 of the 400e6
+    ///      principal; the 20e6 buffer parked on the staker closes the gap and nobody is haircut.
+    ///      Measured from the strategy payout alone (the old behaviour) R would be 380e6, giving
+    ///      alice 95e6 and bob 285e6.
+    function test_initiate_realizedCountsSetAsideBuffer_belowPar() public {
+        MockYieldStrategy strategy = _routeOldThroughStrategy();
+        strategy.setValueFactorBps(9_500);
+
+        // Buffer parked AFTER wiring, so it is idle on the staker rather than swept into the strategy.
+        usdc.mint(address(oldStaker), 20e6);
+
+        migrator.initiateMigration(address(usdc));
+
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertEq(P, 400e6);
+        assertEq(R, 400e6); // 380e6 realized + 20e6 buffer == par
+
+        migrator.migrate(address(usdc), _users());
+        (uint256 aNew,) = newStaker.userInfo(address(usdc), alice);
+        (uint256 bNew,) = newStaker.userInfo(address(usdc), bob);
+        assertEq(aNew, 100e6); // not 95e6
+        assertEq(bNew, 300e6); // not 285e6
+    }
+
+    /// @dev R is capped at P: an above-par balance pays principal exactly and never more, and the
+    ///      surplus stays protocol-owned on the staker.
+    function test_initiate_realizedCappedAtPar() public {
+        _routeOldThroughStrategy();
+        // Above-par donation parked on the staker after wiring: balance at exit time is 475e6.
+        usdc.mint(address(oldStaker), 75e6);
+
+        migrator.initiateMigration(address(usdc));
+
+        (uint256 R, uint256 P) = oldStaker.migrationInfo(address(usdc));
+        assertEq(P, 400e6);
+        assertEq(R, 400e6);
+
+        migrator.migrate(address(usdc), _users());
+        (uint256 aNew,) = newStaker.userInfo(address(usdc), alice);
+        (uint256 bNew,) = newStaker.userInfo(address(usdc), bob);
+        assertEq(aNew, 100e6);
+        assertEq(bNew, 300e6);
+        assertEq(usdc.balanceOf(address(oldStaker)), 75e6); // surplus retained by the protocol
     }
 }
 
