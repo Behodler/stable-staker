@@ -176,7 +176,11 @@ contract MockYieldStrategy is IYieldStrategy {
         if (grossToRequest > available) {
             grossToRequest = available;
         }
-        netGuaranteed = (grossToRequest * denominator) / 10_000;
+        // Mirror {withdraw} exactly, par cap first and exit haircut second, so an underwater
+        // strategy's preview agrees with its delivery instead of quietly over-quoting.
+        uint256 valued = (grossToRequest * valueFactorBps) / 10_000;
+        netGuaranteed = valued < grossToRequest ? valued : grossToRequest;
+        netGuaranteed = (netGuaranteed * denominator) / 10_000;
         netGuaranteed = (netGuaranteed * (10_000 + previewOverQuoteBps)) / 10_000;
     }
 

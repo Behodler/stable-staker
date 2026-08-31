@@ -26,8 +26,7 @@ contract MockERC4626Vault is ERC4626 {
 /// @dev Minimal transferFrom helper so the mock does not drag in SafeERC20's full surface.
 library SafeERC20Lite {
     function transferFrom(address token, address from, address to, uint256 amount) internal {
-        (bool ok, bytes memory ret) =
-            token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
+        (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
         require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "MockERC4626Vault: transferFrom failed");
     }
 }

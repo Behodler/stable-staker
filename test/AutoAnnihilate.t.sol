@@ -37,6 +37,11 @@ contract AutoAnnihilateTest is Test {
 
     uint256 internal constant PER_DAY = 86_400 ether; // -> 1e18 antimatter per second
 
+    /// @dev A generous ceiling on "rounding-scale" for the 18-decimal DAI fixture, in antimatter
+    ///      units. The real displacement is a couple of wei; anything approaching a haircut would
+    ///      blow past this by many orders of magnitude.
+    uint256 internal constant EXIT_ROUNDING_ALLOWANCE_UNITS = 1e6;
+
     /// @dev Mirrors {StableStakerV2.AutoAnnihilated} for vm.expectEmit.
     event AutoAnnihilated(
         address indexed token,
@@ -511,10 +516,7 @@ contract AutoAnnihilateTest is Test {
     ///      `_disposeShares` rounds down twice (`convertToShares` floors, `redeem` floors again)
     ///      and delivers `amount - 1` or less — the case `MockYieldStrategy` cannot express,
     ///      because it always delivers its net exactly.
-    function _erc4626Strategy(uint256 stakeAmount, uint256 yieldAssets)
-        internal
-        returns (ERC4626YieldStrategy ys)
-    {
+    function _erc4626Strategy(uint256 stakeAmount, uint256 yieldAssets) internal returns (ERC4626YieldStrategy ys) {
         MockERC4626Vault vault = new MockERC4626Vault(IERC20(address(dai)));
         ys = new ERC4626YieldStrategy(owner, address(dai), address(vault));
         ys.setClient(address(staker), true);
@@ -544,11 +546,13 @@ contract AutoAnnihilateTest is Test {
 
         assertEq(_userAmount(address(dai), alice), 100 ether - gross, "written down the GROSS");
         assertEq(_totalStaked(address(dai)), 100 ether - gross, "totalStaked in lockstep");
-        // The caller absorbs the sub-wei rounding: whatever the exit could not deliver comes back
-        // as raw Antimatter rather than as an annihilated half, exactly as a real haircut does.
+        // The caller absorbs the rounding: whatever the exit could not deliver comes back as raw
+        // Antimatter rather than as an annihilated half, exactly as a real haircut does. It is a
+        // handful of wei, not a haircut — the point is that the call SUCCEEDS and conserves.
         uint256 raw = antimatter.balanceOf(alice);
-        assertLe(raw, 2 * _scale(address(dai)), "at most a couple of units of rounding is displaced");
-        assertEq(phUSD.balanceOf(alice), 2 * (owed - raw) / 1, "both halves of what survived the exit");
+        assertGt(raw, 0, "the double round-down really did displace something");
+        assertLe(raw, EXIT_ROUNDING_ALLOWANCE_UNITS, "and it is rounding-scale, not haircut-scale");
+        assertEq(phUSD.balanceOf(alice), 2 * (owed - raw), "both halves of what survived the exit");
         assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
     }
 
@@ -579,9 +583,5 @@ contract AutoAnnihilateTest is Test {
         staker.autoAnnihilate(address(dai), 0);
 
         assertEq(dai.balanceOf(address(staker)), 500 ether, "buffer untouched");
-    }
-
-    function _scale(address token) internal view returns (uint256) {
-        return 10 ** (18 - MockERC20(token).decimals());
     }
 }

@@ -57,6 +57,29 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     ///      `STAKER_VERSION` means version 1.
     uint256 public constant STAKER_VERSION = 2;
 
+    /// @notice Absolute rounding allowance, in raw `token` units, subtracted from {autoAnnihilate}'s
+    ///         shortfall floor before the call is judged short.
+    /// @dev NOT a slippage budget. `ERC4626YieldStrategy._disposeShares` redeems
+    ///      `vault.convertToShares(amount)` and the vault's `redeem` then floors the assets back —
+    ///      two independent round-downs, each in the protocol's favour, so an honest vault at a
+    ///      non-integral share price delivers `amount - 1` (or a couple of units more on an
+    ///      awkward price) for an exit it is guaranteeing in full via
+    ///      `AYieldStrategy.previewExitFor`'s capped identity. Without an allowance the floor is an
+    ///      exact equality that no real ERC4626 vault can meet once it has accrued any yield, and
+    ///      since `claimEnabled` is false on deployment this is the ONLY reward path.
+    uint256 public constant EXIT_ROUNDING_ALLOWANCE = 2;
+
+    /// @notice Proportional rounding allowance in basis points, added to {EXIT_ROUNDING_ALLOWANCE}.
+    /// @dev One basis point is rounding-scale, not haircut-scale: it exists only so a vault whose
+    ///      share price is large relative to the request (where one share's worth of assets exceeds
+    ///      a couple of raw units) still clears the floor. It is deliberately far too small to
+    ///      accommodate a real exit haircut — a strategy that genuinely under-delivers, or a preview
+    ///      that lies to widen the raw-mint path around the closed {claim} gate, still reverts.
+    uint256 public constant EXIT_ROUNDING_ALLOWANCE_BPS = 1;
+
+    /// @dev Denominator for {EXIT_ROUNDING_ALLOWANCE_BPS}.
+    uint256 private constant MAX_BPS = 10_000;
+
     /// @notice The Antimatter reward token. This contract must be an approved minter on it.
     IAntimatter public immutable antimatter;
 
@@ -557,7 +580,13 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
             // MANDATORY MEASUREMENT. The preview is advisory: manipulable within a block and built on
             // the fee-free ideal conversion. A delivery under the floor it promised fails the call
             // rather than quietly drawing the difference from the shared idle buffer.
-            require(received > 0 && received >= netFloor, "StableStaker: exit shortfall");
+            // The floor is slackened by a ROUNDING allowance, never a haircut allowance: the
+            // guarantee is quoted from fee-free, ideal conversions, while the exit itself rounds
+            // down at every step in the protocol's favour, so an honest strategy lands a hair under
+            // its own promise. Anything materially short still fails here.
+            uint256 allowance = EXIT_ROUNDING_ALLOWANCE + (netFloor * EXIT_ROUNDING_ALLOWANCE_BPS) / MAX_BPS;
+            uint256 floorWithAllowance = netFloor > allowance ? netFloor - allowance : 0;
+            require(received > 0 && received >= floorWithAllowance, "StableStaker: exit shortfall");
             netUsed = received < netWanted ? received : netWanted;
             surplus = received - netUsed;
         }
