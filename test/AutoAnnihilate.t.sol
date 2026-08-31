@@ -364,4 +364,141 @@ contract AutoAnnihilateTest is Test {
         _autoAnnihilate(alice, address(dai), 0);
         assertEq(dai.allowance(address(staker), address(antimatter)), 0, "approval reset to zero");
     }
+
+    // ==================================================================================
+    // Round 2: exit-haircut sizing.
+    //
+    // Round 1 requested exactly the NET stable the annihilation needed and discarded
+    // `_routeExit`'s return value, so a strategy that sells into an AMM on exit silently
+    // covered its own shortfall out of the shared underwater-withdrawal buffer. Round 2
+    // sizes the request with `IYieldStrategy.previewExitFor` (vault-RM story 050), debits
+    // the caller the GROSS the strategy gave up, and measures the real balance delta.
+    // ==================================================================================
+
+    /// @dev A strategy for DAI that sells on exit: principal is debited by the full gross request,
+    ///      only `gross * (10000 - bps) / 10000` is delivered.
+    function _haircutStrategy(uint256 bps) internal returns (MockYieldStrategy ys) {
+        ys = new MockYieldStrategy();
+        ys.setClient(address(staker), true);
+        ys.setExitSlippageBps(bps);
+        staker.setYieldStrategy(address(dai), ys);
+    }
+
+    function test_autoAnnihilate_fullCreditStrategy_isUnchangedAndLeavesTheBufferAlone() public {
+        _haircutStrategy(0);
+        _stake(alice, address(dai), 100 ether);
+        dai.mint(address(staker), 25 ether); // idle buffer: shared, and none of this call's business
+        vm.warp(block.timestamp + 50);
+
+        // Byte-for-byte the round-1 figures: gross == net when the strategy takes no haircut.
+        vm.expectEmit(true, true, false, true, address(staker));
+        emit AutoAnnihilated(address(dai), alice, 50 ether, 50 ether, 0);
+        _autoAnnihilate(alice, address(dai), 0);
+
+        assertEq(_userAmount(address(dai), alice), 50 ether, "principal reduced by the net");
+        assertEq(_totalStaked(address(dai)), 50 ether, "totalStaked in lockstep");
+        assertEq(phUSD.balanceOf(alice), 100 ether, "both halves paid");
+        assertEq(antimatter.balanceOf(alice), 0, "nothing minted raw");
+        assertEq(dai.balanceOf(address(staker)), 25 ether, "idle buffer untouched");
+    }
+
+    function test_autoAnnihilate_haircutStrategy_debitsTheGrossNotTheNet() public {
+        MockYieldStrategy ys = _haircutStrategy(200);
+        _stake(alice, address(dai), 100 ether);
+        dai.mint(address(staker), 25 ether);
+        vm.warp(block.timestamp + 50);
+
+        uint256 owed = staker.claimableReward(address(dai), alice);
+        assertEq(owed, 50 ether, "precondition: owed");
+        (uint256 gross, uint256 net) = ys.previewExitFor(address(dai), address(staker), owed);
+        assertGt(gross, owed, "the gross-up is what the preview exists to supply");
+        assertGe(net, owed, "an uncapped gross-up still covers the whole annihilation");
+
+        vm.expectEmit(true, true, false, true, address(staker));
+        emit AutoAnnihilated(address(dai), alice, owed, gross, 0);
+        _autoAnnihilate(alice, address(dai), 0);
+
+        assertEq(_userAmount(address(dai), alice), 100 ether - gross, "user written down the GROSS");
+        assertEq(_totalStaked(address(dai)), 100 ether - gross, "totalStaked in lockstep with the gross");
+        assertEq(phUSD.balanceOf(alice), 2 * owed, "the whole reward was annihilated");
+        assertEq(antimatter.balanceOf(alice), 0, "nothing displaced while the principal cap is slack");
+        // Anything the exit over-delivered belongs to the caller, not to the shared buffer.
+        assertEq(dai.balanceOf(alice), 1_000_000 ether - 100 ether + (net - owed), "over-delivery returned");
+        assertEq(dai.balanceOf(address(staker)), 25 ether, "idle buffer untouched");
+    }
+
+    function test_autoAnnihilate_wholePositionAgainstAHaircut_doesNotUnderflow() public {
+        _haircutStrategy(200);
+        _stake(alice, address(dai), 100 ether);
+        vm.warp(block.timestamp + 100);
+        assertEq(staker.claimableReward(address(dai), alice), 100 ether, "precondition: owed == principal");
+
+        // The story's worked example: gross-withdraw 100, receive 98, annihilate 98, mint 2.
+        vm.expectEmit(true, true, false, true, address(staker));
+        emit AutoAnnihilated(address(dai), alice, 98 ether, 100 ether, 2 ether);
+        _autoAnnihilate(alice, address(dai), 0);
+
+        assertEq(_userAmount(address(dai), alice), 0, "whole position consumed, no underflow");
+        assertEq(_totalStaked(address(dai)), 0, "totalStaked in lockstep");
+        assertEq(staker.stakerCount(address(dai)), 0, "staker removed from the set");
+        assertEq(antimatter.balanceOf(alice), 2 ether, "haircut-displaced antimatter minted to the caller");
+        assertEq(phUSD.balanceOf(alice), 196 ether, "both halves of the 98 that survived the exit");
+        assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
+    }
+
+    function test_autoAnnihilate_acrossSlippageTolerances_conservesTheReward() public {
+        uint256[3] memory tolerances = [uint256(0), 500, 2_000];
+        for (uint256 i = 0; i < tolerances.length; i++) {
+            uint256 snap = vm.snapshotState();
+            MockYieldStrategy ys = _haircutStrategy(tolerances[i]);
+            _stake(alice, address(dai), 100 ether);
+            vm.warp(block.timestamp + 100); // owed == principal: the cap binds at every tolerance
+
+            (uint256 gross, uint256 net) = ys.previewExitFor(address(dai), address(staker), 100 ether);
+            assertEq(gross, 100 ether, "the account's principal caps the gross");
+
+            _autoAnnihilate(alice, address(dai), 0);
+
+            assertEq(_userAmount(address(dai), alice), 0, "debited the GROSS");
+            assertEq(_totalStaked(address(dai)), 0, "totalStaked in lockstep");
+            assertEq(phUSD.balanceOf(alice), 2 * net, "annihilated the NET the gross yielded");
+            assertEq(antimatter.balanceOf(alice), 100 ether - net, "the displaced remainder is minted");
+            assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
+            vm.revertToState(snap);
+        }
+    }
+
+    function test_autoAnnihilate_lyingPreview_revertsAndNeverDrawsOnTheBuffer() public {
+        MockYieldStrategy ys = _haircutStrategy(200);
+        ys.setPreviewOverQuoteBps(500); // guarantees 5% more than it will deliver
+        _stake(alice, address(dai), 100 ether);
+        dai.mint(address(staker), 500 ether); // a fat buffer the shortfall must not reach
+        vm.warp(block.timestamp + 50);
+
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: exit shortfall"));
+        staker.autoAnnihilate(address(dai), 0);
+
+        assertEq(dai.balanceOf(address(staker)), 500 ether, "buffer untouched");
+        assertEq(_userAmount(address(dai), alice), 100 ether, "no partial fill");
+        assertEq(antimatter.balanceOf(alice), 0, "no partial fill");
+    }
+
+    function test_autoAnnihilate_strategyThatGuaranteesNothing_isUnavailable() public {
+        _haircutStrategy(10_000); // 100% tolerance: previewExitFor answers (0, 0)
+        _stake(alice, address(dai), 100 ether);
+        vm.warp(block.timestamp + 50);
+
+        assertFalse(staker.autoAnnihilateAvailable(address(dai)), "view agrees with the call");
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: token not annihilatable"));
+        staker.autoAnnihilate(address(dai), 0);
+    }
+
+    function test_autoAnnihilateAvailable_staysTrueForAWorkingStrategy() public {
+        _haircutStrategy(200);
+        assertTrue(staker.autoAnnihilateAvailable(address(dai)), "empty pool: nothing to guarantee yet");
+        _stake(alice, address(dai), 100 ether);
+        assertTrue(staker.autoAnnihilateAvailable(address(dai)), "funded pool with a survivable haircut");
+    }
 }
