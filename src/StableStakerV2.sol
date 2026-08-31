@@ -166,10 +166,12 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     event ClaimEnabledSet(bool enabled);
 
     /// @notice Emitted by {autoAnnihilate}. `antimatterBurned` is the 18-decimal amount annihilated,
-    ///         `principalConsumed` is the caller's own booked principal it was annihilated against
-    ///         (in `token` decimals), and `excessMinted` is the reward that outran that principal and
-    ///         was minted straight to the caller. Sub-unit dust appears in neither: it stays booked in
-    ///         {unclaimedReward}.
+    ///         `principalConsumed` is the GROSS booked principal the caller gave up for it (in `token`
+    ///         decimals) — which under a strategy that sells on exit is MORE than the stable half the
+    ///         annihilation consumed, the difference being the exit haircut the caller absorbed — and
+    ///         `excessMinted` is the reward that could not be annihilated (it outran the principal, or
+    ///         the haircut displaced it) and was minted straight to the caller. Sub-unit dust appears
+    ///         in none of the three: it stays booked in {unclaimedReward}.
     event AutoAnnihilated(
         address indexed token,
         address indexed user,
@@ -454,6 +456,30 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
      *           the stable half is approved to Antimatter, and `recipient` is the user: the phUSD
      *           lands in their wallet with no second transfer. The approval is reset to zero after.
      *
+     *      EXIT-HAIRCUT SIZING (round 2). A strategy that sells its position on exit — the market
+     *      strategy always does — delivers LESS than it is asked for. Requesting the net the
+     *      annihilation needs and burning that net anyway would silently pay the difference out of
+     *      this contract's idle balance, which is the SHARED underwater-withdrawal buffer: one
+     *      caller's routine exit loss socialised across every staker. So instead:
+     *        a. {IYieldStrategy-previewExitFor} (vault-RM story 050) reports the GROSS that must be
+     *           requested to net what the annihilation needs, and the floor that gross guarantees.
+     *        b. The GROSS — not the net — is capped at the caller's own `user.amount`. Capping the net
+     *           instead would underflow `user.amount` for exactly the caller annihilating their whole
+     *           position, since the gross they must give up exceeds it.
+     *        c. `user.amount` and `pool.totalStaked` are debited by the GROSS: the caller is written
+     *           down everything the strategy gave up, exactly as {withdraw} does. This is the same
+     *           outcome as withdrawing manually and annihilating in their own wallet.
+     *        d. The Antimatter the haircut displaced — the reward the shrunken net can no longer be
+     *           annihilated against — joins `excess` and is minted straight to the caller.
+     *        e. The preview is ADVISORY ONLY. It reads live AMM state, is manipulable within a block,
+     *           and is built on the FEE-FREE `convertToAssets` (vault-RM 049), so it can over-quote in
+     *           two independent ways. The real balance delta across the exit is therefore MEASURED,
+     *           and a delivery below the pro-rated guarantee reverts `"StableStaker: exit shortfall"`.
+     *           A lying preview must fail the transaction, never raid the buffer.
+     *        f. Anything the exit OVER-delivers (the AMM pays at or above its floor) is forwarded to
+     *           the caller: they were debited the gross, so the surplus is theirs, and leaving it here
+     *           would quietly grow the buffer at their expense.
+     *
      *      Gated on `PoolState.Active` like {stake} / {withdraw} / {emergencyWithdraw}, because unlike
      *      {claim} this moves principal and would corrupt the terminal-migration `P` snapshot.
      *      `annihilate` is `whenNotPaused` against ANTIMATTER's pauser, which this contract does not
@@ -473,9 +499,10 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
         // The 18-decimal antimatter scale for one raw unit of `token`.
         uint256 scale = _antimatterScale(token);
-        uint256 annihilatable;
-        uint256 stableNeeded;
-        uint256 excess;
+        uint256 netWanted; // the stable half the annihilation needs, in `token` decimals
+        uint256 gross; // the principal the caller gives up to obtain it
+        uint256 netFloor; // the least the exit may deliver before this call is a shortfall
+        uint256 excessBase; // reward that outran the principal outright; minted to the caller
 
         // Scoped so the intermediate arithmetic leaves the stack before the interactions below.
         {
@@ -483,25 +510,37 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
             _updatePool(token);
             UserInfo storage user = userInfo[token][msg.sender];
 
-            // Byte-identical to {claim}: the settled backlog plus anything freshly pending.
-            uint256 owed = unclaimedReward[token][msg.sender]
-                + ((user.amount * pool.accAntimatterPerShare) / ACC_PRECISION - user.rewardDebt);
-            uint256 principalAsAntimatter = user.amount * scale;
-            // Capped at the caller's own principal, then floored to something `token` can express:
-            // toStableAmount reverts on a finer amount rather than rounding it away.
-            uint256 capped = owed < principalAsAntimatter ? owed : principalAsAntimatter;
-            annihilatable = (capped / scale) * scale;
-            excess = owed - capped; // outran the principal; minted straight to the caller
-            require(annihilatable > 0 || excess > 0, "StableStaker: nothing to annihilate");
-            stableNeeded = annihilatable / scale;
+            {
+                // Byte-identical to {claim}: the settled backlog plus anything freshly pending.
+                uint256 owed = unclaimedReward[token][msg.sender]
+                    + ((user.amount * pool.accAntimatterPerShare) / ACC_PRECISION - user.rewardDebt);
+                uint256 principalAsAntimatter = user.amount * scale;
+                // Capped at the caller's own principal, then floored to something `token` can express:
+                // toStableAmount reverts on a finer amount rather than rounding it away.
+                uint256 capped = owed < principalAsAntimatter ? owed : principalAsAntimatter;
+                netWanted = capped / scale;
+                excessBase = owed - capped;
+                require(netWanted > 0 || excessBase > 0, "StableStaker: nothing to annihilate");
+                // The sub-unit remainder, carried in the mapping rather than paid out.
+                unclaimedReward[token][msg.sender] = capped - netWanted * scale;
+            }
+
+            {
+                // Size the exit against the strategy's haircut, then cap the GROSS — never the net —
+                // at the caller's own principal, or the debit below underflows for the caller
+                // annihilating their whole position. `netFloor` is pro-rated when our cap bites,
+                // because the quote was issued for the uncapped request.
+                (uint256 grossQuote, uint256 netQuote) = _previewExit(token, netWanted);
+                require(netWanted == 0 || grossQuote > 0, "StableStaker: exit unavailable");
+                gross = grossQuote > user.amount ? user.amount : grossQuote;
+                netFloor = grossQuote == 0 ? 0 : (netQuote * gross) / grossQuote;
+            }
 
             // Effects. All four parts of the bookkeeping, none of them optional: a stale `rewardDebt`
             // underflows every later settle and bricks the position, and a staker left in the set
-            // makes finalizeAndReset's `stakerCount == 0` unsatisfiable. `capped - annihilatable` is
-            // the sub-unit remainder, carried in the mapping rather than paid out.
-            unclaimedReward[token][msg.sender] = capped - annihilatable;
-            user.amount -= stableNeeded;
-            pool.totalStaked -= stableNeeded;
+            // makes finalizeAndReset's `stakerCount == 0` unsatisfiable.
+            user.amount -= gross;
+            pool.totalStaked -= gross;
             user.rewardDebt = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION;
             if (user.amount == 0) {
                 _stakers[token].remove(msg.sender);
@@ -509,22 +548,39 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         }
 
         // Interactions.
-        if (annihilatable > 0) {
+        uint256 netUsed;
+        uint256 surplus;
+        if (gross > 0) {
             // Underwater guard ON, matching {withdraw}: this is a voluntary principal exit, not an
-            // escape hatch, so it must not realize a loss the user did not opt into. The return value
-            // is deliberately unused — a short delivery is covered by the contract's idle buffer if
-            // there is one, and reverts inside `annihilate`'s transferFrom if there is not.
-            _routeExit(token, stableNeeded, true);
+            // escape hatch, so it must not realize a loss the user did not opt into.
+            uint256 received = _routeExit(token, gross, true);
+            // MANDATORY MEASUREMENT. The preview is advisory: manipulable within a block and built on
+            // the fee-free ideal conversion. A delivery under the floor it promised fails the call
+            // rather than quietly drawing the difference from the shared idle buffer.
+            require(received > 0 && received >= netFloor, "StableStaker: exit shortfall");
+            netUsed = received < netWanted ? received : netWanted;
+            surplus = received - netUsed;
+        }
+        uint256 annihilatable = netUsed * scale;
+        // Everything the annihilation could not consume: the reward that outran the principal
+        // (`owed - capped`) plus the reward the exit haircut displaced.
+        uint256 excess = excessBase + (netWanted - netUsed) * scale;
+
+        if (annihilatable > 0) {
             antimatter.mint(address(this), annihilatable);
-            IERC20(token).forceApprove(address(antimatter), stableNeeded);
+            IERC20(token).forceApprove(address(antimatter), netUsed);
             antimatter.annihilate(token, msg.sender, annihilatable, minPhUSDOut);
             IERC20(token).forceApprove(address(antimatter), 0);
         }
         if (excess > 0) {
             antimatter.mint(msg.sender, excess);
         }
+        if (surplus > 0) {
+            // Over-delivery belongs to the caller, who was debited the gross that produced it.
+            IERC20(token).safeTransfer(msg.sender, surplus);
+        }
 
-        emit AutoAnnihilated(token, msg.sender, annihilatable, stableNeeded, excess);
+        emit AutoAnnihilated(token, msg.sender, annihilatable, gross, excess);
     }
 
     /**
@@ -946,18 +1002,40 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
     /**
      * @notice True when {autoAnnihilate} can work for `token`: the pool token is ALSO a registered
-     *         stablecoin on the phUSD stable minter, with decimals the minter and the token agree on.
+     *         stablecoin on the phUSD stable minter (with decimals the minter and the token agree on)
+     *         AND, if a yield strategy is set, that strategy can guarantee anything at all on exit.
      * @dev A live cross-contract configuration coupling StableStaker has never had before —
      *      registering a pool token with the stable minter is now part of the pool-registration
      *      runbook. Probed with a staticcall rather than a try/catch, because Antimatter's
      *      `toStableAmount` can fail through a return-data decode that a catch block would not
      *      intercept. `1e18` is representable in every decimals <= 18, so a failure here means the
      *      configuration, never the amount.
+     *
+     *      The strategy leg (round 2) keeps the view honest about the exit: a market strategy set to
+     *      a 100% slippage tolerance answers `(0, 0)` to every {IYieldStrategy-previewExitFor}, i.e.
+     *      it guarantees no output whatsoever, and {autoAnnihilate} would rather refuse than mint the
+     *      whole reward raw through the `excess` path and hand the caller a bypass of a closed
+     *      {claim}. The probe is skipped when the strategy custodies nothing for this pool: there is
+     *      then no principal to annihilate against anyway, and the reward-outran-principal path still
+     *      works, so reporting `false` would be the inconsistent answer.
      */
     function autoAnnihilateAvailable(address token) public view returns (bool) {
         (bool ok, bytes memory data) =
             address(antimatter).staticcall(abi.encodeCall(IAntimatter.toStableAmount, (token, 1e18)));
-        return ok && data.length == 32;
+        if (!ok || data.length != 32) {
+            return false;
+        }
+        IYieldStrategy strategy = yieldStrategy[token];
+        if (address(strategy) == address(0) || strategy.principalOf(token, address(this)) == 0) {
+            return true;
+        }
+        (bool previewOk, bytes memory previewData) =
+            address(strategy).staticcall(abi.encodeCall(IYieldStrategy.previewExitFor, (token, address(this), 1)));
+        if (!previewOk || previewData.length != 64) {
+            return false;
+        }
+        (uint256 grossQuote,) = abi.decode(previewData, (uint256, uint256));
+        return grossQuote > 0;
     }
 
     // ============================== INTERNAL ==============================
@@ -1046,6 +1124,28 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
      * @param guardUnderwater When true (the non-migrating `withdraw` path), reverts if the strategy
      *      is below par. The escape hatch and migration pass false so they always succeed.
      */
+    /**
+     * @dev Size a strategy exit: the GROSS that must be requested to net `netWanted`, and the floor
+     *      that gross is guaranteed to deliver. With no strategy set the principal is already idle in
+     *      this contract, so gross == net == `netWanted` and nothing is haircut.
+     *
+     *      ⚠️ `netGuaranteed` is a FLOOR, not an expectation and not a settlement figure. It reads
+     *      live vault and AMM state (manipulable within a block) and is built on the fee-free
+     *      `convertToAssets` (vault-RM 049), so it can over-quote in two independent ways. Callers
+     *      MUST measure the real balance delta across the exit — see {autoAnnihilate}.
+     */
+    function _previewExit(address token, uint256 netWanted)
+        internal
+        view
+        returns (uint256 grossToRequest, uint256 netGuaranteed)
+    {
+        IYieldStrategy strategy = yieldStrategy[token];
+        if (address(strategy) == address(0)) {
+            return (netWanted, netWanted);
+        }
+        return strategy.previewExitFor(token, address(this), netWanted);
+    }
+
     function _routeExit(address token, uint256 amount, bool guardUnderwater) internal returns (uint256 payout) {
         IYieldStrategy strategy = yieldStrategy[token];
         if (address(strategy) == address(0)) {
