@@ -362,8 +362,13 @@ Plain git submodules under `lib/` (no "mutable dependency" mechanism):
 
 - `lib/openzeppelin-contracts` — external, pinned to tag `v5.6.1`.
 - `lib/forge-std` — external, pinned to tag `v1.16.1`.
-- `lib/flax-token` — phoenix project, tracks `master` HEAD. phUSD; still the emissions token of
-  the frozen V1 snapshot.
+- `lib/flax-token` — **REMOVED** (story 024). phUSD is still the emissions token of the frozen V1
+  snapshot, but the two reachable source files are now vendored verbatim at
+  `src/versions/v1/vendor/IFlax.sol` and `src/versions/v1/vendor/FlaxToken.sol`
+  (from `Behodler/flax-token-v2@f5300117e94bd30349fb88f426d434ef1ccddce0`), and the `flax-token/`
+  remapping points there. Keeping the remapping NAME is what spares every import site — the two
+  hash-pinned frozen files and the V1-covering tests — from any change. See
+  `src/versions/README.md` for the retirement steps.
 - `lib/antimatter` — phoenix project, pinned at `a5570ce`. Provides the `Antimatter` emissions
   token that `StableStakerV2` mints (story 023). Remapped as `antimatter/=lib/antimatter/src/`,
   with the transitive `@phUSD/`, `@phUSDMinter/` and `@pauser/` remappings its sources need.

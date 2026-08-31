@@ -13,7 +13,16 @@ code_size_limit = 100000
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "forge-std/=lib/forge-std/src/",
-    "flax-token/=lib/flax-token/src/",
+    # The `flax-token/` remapping NAME is retained deliberately even though it now points
+    # inside the frozen V1 directory. Keeping the name is what spares every import site --
+    # the two hash-pinned frozen files (src/versions/v1/StableStakerV1.sol,
+    # IStableStakerV1.sol) and the V1-covering tests -- from any change at all. The
+    # frozen files are pinned in src/versions/v1/FROZEN.sha256, so their import lines
+    # cannot be rewritten; the redirection happens here instead. Story 024 vendored
+    # IFlax.sol and FlaxToken.sol from Behodler/flax-token-v2@f5300117 and dropped the
+    # lib/flax-token submodule. Retiring V1 = delete src/versions/v1/ AND remove this
+    # line (and its twin in remappings.txt).
+    "flax-token/=src/versions/v1/vendor/",
     "pauser/=lib/pauser/src/",
     "reflax-yield-vault/=lib/reflax-yield-vault/src/",
     "antimatter/=lib/antimatter/src/",

@@ -172,6 +172,59 @@ Two consequences that are load-bearing:
   those submodule interfaces change shape, the frozen files inherit the churn. This is the most
   likely reason a frozen contract stops compiling; see step 3 for what is and is not allowed in
   response.
+  `IFlax` is no longer such a coupling — story 024 vendored it into `v1/vendor/` (below), so it
+  can only change when someone in this repo changes it.
+
+## `v1/vendor/` — the vendored flax-token sources (story 024)
+
+`v1/vendor/` holds byte-for-byte copies of the only two files ever reachable through the
+`flax-token/` remapping:
+
+| Vendored file | Copied from |
+|---|---|
+| `v1/vendor/IFlax.sol` | `Behodler/flax-token-v2` @ `f5300117e94bd30349fb88f426d434ef1ccddce0`, `src/IFlax.sol` |
+| `v1/vendor/FlaxToken.sol` | same repo/commit, `src/FlaxToken.sol` |
+
+Each carries a provenance header recording that repo and commit; the body below the header is
+byte-for-byte the source, stale Flax/FLX NatSpec included. Their whole import graph is OpenZeppelin
+plus each other, and `@openzeppelin/contracts/` was already a remapping here, so vendoring
+introduced no new dependency. The `lib/flax-token` submodule was removed from `.gitmodules`,
+`foundry.lock` and the working tree in the same story.
+
+`IFlax.sol` is what the frozen V1 sources import. `FlaxToken.sol` is the concrete token, used only
+as a test double by the V1-covering tests (`test/StableStakerV1Snapshot.t.sol`); without it those
+tests stop compiling.
+
+### Why the redirection is at the remapping, not at the import sites
+
+The obvious edit — rewriting `import "flax-token/IFlax.sol";` in `v1/StableStakerV1.sol` and
+`v1/IStableStakerV1.sol` to a relative path — is **forbidden**. Both files are hash-pinned in
+`v1/FROZEN.sha256`, check 4 of `.github/scripts/check-migration-surface.sh` verifies those hashes,
+and regenerating the manifest is named elsewhere in this document as not an acceptable fix. So the
+frozen files stay byte-identical and `foundry.toml` / `remappings.txt` point `flax-token/` at
+`src/versions/v1/vendor/` instead. Because the remapping keeps its NAME, **no import site changed
+at all** — not the two frozen files, not `test/StableStakerV1Frozen.t.sol`, not
+`test/StableStakerV1Snapshot.t.sol`.
+
+The vendored copies are **not** added to `v1/FROZEN.sha256`. That script asserts the manifest holds
+exactly two entries and fails loudly if it grows; the manifest keeps exactly its two existing lines.
+The vendored files are ordinary tracked source, protected by review and by V1 being frozen, not by a
+hash pin. (The snapshot glob `src/versions/v*/IStableStakerV*.sol` matches nothing under `vendor/`,
+so check 3 is unaffected by the new directory.)
+
+### Retirement is now a TWO-STEP operation
+
+When the deployed V1 at `0xbce8ABC09BaEDCabE93419bF875f6186e182079A` is genuinely dead and V1 is
+retired:
+
+1. Delete `src/versions/v1/` — which now takes the vendored flax-token copies with it.
+2. Remove the `flax-token/=src/versions/v1/vendor/` line from **both** `foundry.toml` and
+   `remappings.txt`. They are duplicates that must stay in sync; dropping one alone leaves a
+   dangling remapping.
+
+Step 2 is easy to miss, which is the whole reason it is written down here. Vendoring is what makes
+step 1 sufficient for the dependency itself: before story 024, deleting `v1/` would have left the
+repo carrying `lib/flax-token` purely to satisfy code that no longer existed.
 
 ## Current snapshots
 

@@ -2,9 +2,6 @@
   "lib/antimatter": {
     "rev": "a5570ce1e96873dc1bc42252580efeab4c88f206"
   },
-  "lib/flax-token": {
-    "rev": "f5300117e94bd30349fb88f426d434ef1ccddce0"
-  },
   "lib/forge-std": {
     "rev": "620536fa5277db4e3fd46772d5cbc1ea0696fb43"
   },
