@@ -26,10 +26,17 @@ contract DeferredAccrualTest is Test {
     /// @dev Mirrors {StableStakerV2.MigratedOut} for vm.expectEmit.
     event MigratedOut(address indexed token, address indexed user, uint256 amount, uint256 reward);
 
+    /// @dev Mirrors {StableStakerV2.ClaimEnabledSet} for vm.expectEmit.
+    event ClaimEnabledSet(bool enabled);
+
     function setUp() public {
         antimatter = new Antimatter(owner);
         staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
         antimatter.setApprovedMinter(address(staker), true);
+        // Story 025 gates `claim` behind an owner flag, off by default. Opened here so the story-022
+        // deferred-accrual tests below keep exercising the claim path; the CLAIM GATE section closes it
+        // again explicitly where the gate itself is under test.
+        staker.setClaimEnabled(true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         dai = new MockERC20("Dai", "DAI", 18);
@@ -330,5 +337,67 @@ contract DeferredAccrualTest is Test {
         assertEq(staker.pendingReward(address(usdc), alice), 0, "pendingReward is projection-only");
         assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         assertEq(staker.claimableReward(address(usdc), alice), 100 ether, "claimable carries the backlog");
+    }
+    // ============================== CLAIM GATE (story 025) ==============================
+
+    /// @notice `claimEnabled` is a UX gate, not an access control: it is off on a freshly deployed
+    ///         staker so users are steered to {StableStakerV2-autoAnnihilate} and learn what
+    ///         antimatter is for. One owner transaction reverses it, with no redeploy.
+    function test_claimEnabled_defaultsToFalseOnAFreshStaker() public {
+        StableStakerV2 fresh = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        assertFalse(fresh.claimEnabled(), "off by default");
+    }
+
+    function test_claim_revertsWhileClaimDisabled() public {
+        staker.setClaimEnabled(false);
+        _stake(alice, address(usdc), 100e6);
+        vm.warp(block.timestamp + 100);
+
+        vm.prank(alice);
+        vm.expectRevert("StableStaker: claim disabled");
+        staker.claim(address(usdc));
+
+        // The reward is not lost, merely unminted: it stays readable and claimable later.
+        assertEq(staker.claimableReward(address(usdc), alice), 100 ether, "reward still owed");
+    }
+
+    function test_claim_succeedsOnceEnabled() public {
+        staker.setClaimEnabled(false);
+        _stake(alice, address(usdc), 100e6);
+        vm.warp(block.timestamp + 100);
+
+        staker.setClaimEnabled(true);
+        vm.prank(alice);
+        staker.claim(address(usdc));
+        assertEq(antimatter.balanceOf(alice), 100 ether, "claim pays the full owed figure");
+    }
+
+    function test_setClaimEnabled_isOwnerOnly() public {
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        staker.setClaimEnabled(false);
+    }
+
+    function test_setClaimEnabled_emitsClaimEnabledSet() public {
+        staker.setClaimEnabled(false);
+        vm.expectEmit(false, false, false, true, address(staker));
+        emit ClaimEnabledSet(true);
+        staker.setClaimEnabled(true);
+    }
+
+    /// @notice The migration carve-out: the antimatter mint inside the terminal-migration exit is
+    ///         deliberately NOT gated by `claimEnabled`. Gating it would let a disabled claim brick
+    ///         migration, which is the one path that must never be brickable.
+    function test_terminalMigrationExit_stillMints_whileClaimDisabled() public {
+        _stake(alice, address(usdc), 100e6);
+        vm.warp(block.timestamp + 100);
+        staker.setClaimEnabled(false);
+
+        staker.setMigrator(owner);
+        staker.initiateMigration(address(usdc));
+        vm.prank(alice);
+        staker.userMigrate(address(usdc));
+
+        assertEq(antimatter.balanceOf(alice), 100 ether, "migration exit pays reward regardless");
     }
 }

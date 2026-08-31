@@ -27,6 +27,9 @@ contract StableStakerTest is Test {
         antimatter = new Antimatter(owner);
         staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
         antimatter.setApprovedMinter(address(staker), true);
+        // Story 025 gates `claim` behind an owner flag, off by default; the gate has its own tests
+        // in DeferredAccrual.t.sol, so open it here.
+        staker.setClaimEnabled(true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         dai = new MockERC20("Dai", "DAI", 18);

@@ -22,6 +22,9 @@ contract EmissionCapTest is Test {
         antimatter = new Antimatter(owner);
         staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
         antimatter.setApprovedMinter(address(staker), true);
+        // Story 025 gates `claim` behind an owner flag, off by default. These tests are about the
+        // emission cap, not the gate, so open it once here.
+        staker.setClaimEnabled(true);
         usdc = new MockERC20("USD Coin", "USDC", 6);
         staker.addToken(address(usdc));
         staker.antimatterPerDay(address(usdc), PER_DAY);

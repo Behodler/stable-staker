@@ -34,6 +34,9 @@ contract MigrationTest is Test {
         antimatter = new Antimatter(owner);
         oldStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
         newStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        // Story 025 gates `claim` behind an owner flag, off by default; this suite claims on the
+        // destination staker after migration, so open it here.
+        newStaker.setClaimEnabled(true);
 
         // both instances may mint antimatter
         antimatter.setApprovedMinter(address(oldStaker), true);
