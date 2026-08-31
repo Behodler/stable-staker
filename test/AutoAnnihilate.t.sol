@@ -10,6 +10,8 @@ import {PhusdStableMinter} from "@phUSDMinter/PhusdStableMinter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 import {MockMinterYieldStrategy} from "./mocks/MockMinterYieldStrategy.sol";
+import {MockERC4626Vault} from "./mocks/MockERC4626Vault.sol";
+import {ERC4626YieldStrategy} from "reflax-yield-vault/concreteYieldStrategies/ERC4626YieldStrategy.sol";
 
 /// @notice Story 025: `claim` is owner-gated and off by default, and {StableStakerV2-autoAnnihilate}
 ///         becomes the reward path. It mints the caller's owed Antimatter to the staker itself,
@@ -500,5 +502,86 @@ contract AutoAnnihilateTest is Test {
         assertTrue(staker.autoAnnihilateAvailable(address(dai)), "empty pool: nothing to guarantee yet");
         _stake(alice, address(dai), 100 ether);
         assertTrue(staker.autoAnnihilateAvailable(address(dai)), "funded pool with a survivable haircut");
+    }
+
+    // --------------------------------------- the production ERC4626 strategy (rounding)
+
+    /// @dev Stands up the REAL `ERC4626YieldStrategy` over a real OZ ERC4626 vault, then donates
+    ///      `yieldAssets` so the share price stops being 1:1. That is the configuration in which
+    ///      `_disposeShares` rounds down twice (`convertToShares` floors, `redeem` floors again)
+    ///      and delivers `amount - 1` or less — the case `MockYieldStrategy` cannot express,
+    ///      because it always delivers its net exactly.
+    function _erc4626Strategy(uint256 stakeAmount, uint256 yieldAssets)
+        internal
+        returns (ERC4626YieldStrategy ys)
+    {
+        MockERC4626Vault vault = new MockERC4626Vault(IERC20(address(dai)));
+        ys = new ERC4626YieldStrategy(owner, address(dai), address(vault));
+        ys.setClient(address(staker), true);
+        staker.setYieldStrategy(address(dai), ys);
+
+        _stake(alice, address(dai), stakeAmount);
+
+        // Donate straight to the vault: assets rise, shares do not, so the price goes non-integral.
+        dai.mint(address(this), yieldAssets);
+        dai.approve(address(vault), yieldAssets);
+        vault.accrue(yieldAssets);
+    }
+
+    function test_autoAnnihilate_realERC4626Strategy_roundingDoesNotRevert() public {
+        // A share price of 100 / 97 — deliberately not a whole number of asset units per share.
+        ERC4626YieldStrategy ys = _erc4626Strategy(100 ether, 97 ether);
+        vm.warp(block.timestamp + 50);
+
+        uint256 owed = staker.claimableReward(address(dai), alice);
+        assertEq(owed, 50 ether, "precondition: owed");
+        (uint256 gross, uint256 net) = ys.previewExitFor(address(dai), address(staker), owed);
+        assertEq(gross, owed, "the default preview is the capped identity");
+        assertEq(net, gross, "...and it guarantees the full gross, which the vault cannot quite pay");
+
+        // Round 2 demanded delivery >= gross to the wei, which this strategy cannot meet.
+        _autoAnnihilate(alice, address(dai), 0);
+
+        assertEq(_userAmount(address(dai), alice), 100 ether - gross, "written down the GROSS");
+        assertEq(_totalStaked(address(dai)), 100 ether - gross, "totalStaked in lockstep");
+        // The caller absorbs the sub-wei rounding: whatever the exit could not deliver comes back
+        // as raw Antimatter rather than as an annihilated half, exactly as a real haircut does.
+        uint256 raw = antimatter.balanceOf(alice);
+        assertLe(raw, 2 * _scale(address(dai)), "at most a couple of units of rounding is displaced");
+        assertEq(phUSD.balanceOf(alice), 2 * (owed - raw) / 1, "both halves of what survived the exit");
+        assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
+    }
+
+    function test_autoAnnihilate_realERC4626Strategy_wholePosition_succeeds() public {
+        ERC4626YieldStrategy ys = _erc4626Strategy(100 ether, 97 ether);
+        ys; // silence unused
+        vm.warp(block.timestamp + 100); // owed == principal: the GROSS cap binds
+
+        _autoAnnihilate(alice, address(dai), 0);
+
+        assertEq(_userAmount(address(dai), alice), 0, "whole position consumed, no underflow");
+        assertEq(_totalStaked(address(dai)), 0, "totalStaked in lockstep");
+        assertEq(staker.stakerCount(address(dai)), 0, "staker removed from the set");
+        assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
+    }
+
+    /// @dev The tolerance is for ROUNDING, not for a haircut: a strategy that under-delivers by a
+    ///      material margin must still fail the call rather than mint the shortfall raw.
+    function test_autoAnnihilate_materialShortfall_stillReverts() public {
+        MockYieldStrategy ys = _haircutStrategy(200);
+        ys.setPreviewOverQuoteBps(10); // 0.1% over-quote: far above the rounding allowance
+        _stake(alice, address(dai), 100 ether);
+        dai.mint(address(staker), 500 ether);
+        vm.warp(block.timestamp + 50);
+
+        vm.prank(alice);
+        vm.expectRevert(bytes("StableStaker: exit shortfall"));
+        staker.autoAnnihilate(address(dai), 0);
+
+        assertEq(dai.balanceOf(address(staker)), 500 ether, "buffer untouched");
+    }
+
+    function _scale(address token) internal view returns (uint256) {
+        return 10 ** (18 - MockERC20(token).decimals());
     }
 }
