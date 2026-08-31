@@ -4,15 +4,15 @@ pragma solidity ^0.8.20;
 import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
 import "../src/interfaces/IStableStakerMigratable.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
-/// @notice Deferred reward accrual (story 022): `stake` and `withdraw` no longer mint phUSD. They
+/// @notice Deferred reward accrual (story 022): `stake` and `withdraw` no longer mint antimatter. They
 ///         book the settled amount to {StableStakerV2-unclaimedReward}, which {claim} and the terminal
 ///         migration exit pay out. The headline property is robustness: with the staker's minter role
 ///         revoked, every principal path still works and only {claim} reverts.
 contract DeferredAccrualTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
     MockERC20 internal usdc; // 6 decimals
     MockERC20 internal dai; // 18 decimals
@@ -21,23 +21,23 @@ contract DeferredAccrualTest is Test {
     address internal alice = address(0xA11CE);
     address internal bob = address(0xB0B);
 
-    uint256 internal constant PER_DAY = 86_400 ether; // -> 1e18 phUSD per second
+    uint256 internal constant PER_DAY = 86_400 ether; // -> 1e18 antimatter per second
 
     /// @dev Mirrors {StableStakerV2.MigratedOut} for vm.expectEmit.
     event MigratedOut(address indexed token, address indexed user, uint256 amount, uint256 reward);
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(staker), true);
+        antimatter = new Antimatter(owner);
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         dai = new MockERC20("Dai", "DAI", 18);
 
         staker.addToken(address(usdc));
         staker.addToken(address(dai));
-        staker.phUSDPerDay(address(usdc), PER_DAY);
-        staker.phUSDPerDay(address(dai), PER_DAY);
+        staker.antimatterPerDay(address(usdc), PER_DAY);
+        staker.antimatterPerDay(address(dai), PER_DAY);
 
         _fund(alice);
         _fund(bob);
@@ -70,7 +70,7 @@ contract DeferredAccrualTest is Test {
 
         _stake(alice, address(usdc), 50e6);
 
-        assertEq(phUSD.balanceOf(alice), 0, "stake must not mint");
+        assertEq(antimatter.balanceOf(alice), 0, "stake must not mint");
         assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether, "stake books the pending");
         assertEq(staker.pendingReward(address(usdc), alice), 0, "rewardDebt reset as before");
     }
@@ -83,7 +83,7 @@ contract DeferredAccrualTest is Test {
         _withdraw(alice, address(usdc), 40e6);
 
         assertEq(usdc.balanceOf(alice), balBefore + 40e6, "principal payout unchanged");
-        assertEq(phUSD.balanceOf(alice), 0, "withdraw must not mint");
+        assertEq(antimatter.balanceOf(alice), 0, "withdraw must not mint");
         assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 60e6);
@@ -97,7 +97,7 @@ contract DeferredAccrualTest is Test {
         _withdraw(alice, address(usdc), 100e6);
 
         assertEq(usdc.balanceOf(alice), balBefore + 100e6);
-        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(antimatter.balanceOf(alice), 0);
         assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         assertEq(staker.stakerCount(address(usdc)), 0);
     }
@@ -113,9 +113,9 @@ contract DeferredAccrualTest is Test {
         vm.prank(alice);
         staker.claim(address(usdc));
 
-        // 1 wei tolerance: `accPhusdPerShare` truncates when totalStaked changes mid-window. That
+        // 1 wei tolerance: `accAntimatterPerShare` truncates when totalStaked changes mid-window. That
         // dust is retained by the protocol, exactly as before this change.
-        assertApproxEqAbs(phUSD.balanceOf(alice), 200 ether, 1, "claim mints backlog + pending");
+        assertApproxEqAbs(antimatter.balanceOf(alice), 200 ether, 1, "claim mints backlog + pending");
         assertEq(staker.unclaimedReward(address(usdc), alice), 0, "backlog drained");
 
         vm.prank(alice);
@@ -134,7 +134,7 @@ contract DeferredAccrualTest is Test {
 
         vm.prank(alice);
         staker.claim(address(usdc));
-        assertEq(phUSD.balanceOf(alice), 100 ether);
+        assertEq(antimatter.balanceOf(alice), 100 ether);
         assertEq(staker.unclaimedReward(address(usdc), alice), 0);
     }
 
@@ -151,7 +151,7 @@ contract DeferredAccrualTest is Test {
         staker.emergencyWithdraw(address(usdc));
 
         assertEq(staker.unclaimedReward(address(usdc), alice), 0, "escape hatch forfeits the backlog");
-        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(antimatter.balanceOf(alice), 0);
         assertEq(staker.claimableReward(address(usdc), alice), 0);
 
         vm.prank(alice);
@@ -180,11 +180,11 @@ contract DeferredAccrualTest is Test {
         vm.prank(bob);
         staker.claim(address(dai));
 
-        // 1 wei apart at most: the only difference is `accPhusdPerShare` truncation at the extra
+        // 1 wei apart at most: the only difference is `accAntimatterPerShare` truncation at the extra
         // settlement point, which pre-dates this story and rounds in the protocol's favour.
-        assertApproxEqAbs(phUSD.balanceOf(alice), 200 ether, 1);
-        assertEq(phUSD.balanceOf(bob), 200 ether);
-        assertApproxEqAbs(phUSD.balanceOf(alice), phUSD.balanceOf(bob), 1, "payout is path-independent");
+        assertApproxEqAbs(antimatter.balanceOf(alice), 200 ether, 1);
+        assertEq(antimatter.balanceOf(bob), 200 ether);
+        assertApproxEqAbs(antimatter.balanceOf(alice), antimatter.balanceOf(bob), 1, "payout is path-independent");
     }
 
     // ------------------------------------------------------ ROBUSTNESS (headline)
@@ -196,7 +196,7 @@ contract DeferredAccrualTest is Test {
         _stake(bob, address(usdc), 100e6);
         vm.warp(block.timestamp + 100);
 
-        phUSD.setMinter(address(staker), false);
+        antimatter.setApprovedMinter(address(staker), false);
 
         // stake on an existing position: settles, does not mint.
         _stake(alice, address(usdc), 10e6);
@@ -209,9 +209,10 @@ contract DeferredAccrualTest is Test {
         vm.prank(bob);
         staker.emergencyWithdraw(address(usdc));
 
-        // Only claim needs the minter role.
+        // Only claim needs the minter role. Antimatter rejects the revoked staker with a custom
+        // error, not a reason string.
         vm.prank(alice);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(Antimatter.NotApprovedMinter.selector, address(staker)));
         staker.claim(address(usdc));
     }
 
@@ -238,7 +239,7 @@ contract DeferredAccrualTest is Test {
         users[0] = alice;
         staker.batchMigrate(address(usdc), users);
 
-        assertEq(phUSD.balanceOf(alice), 200 ether, "exit pays pending + unclaimed");
+        assertEq(antimatter.balanceOf(alice), 200 ether, "exit pays pending + unclaimed");
         assertEq(staker.unclaimedReward(address(usdc), alice), 0, "backlog drained by the exit");
     }
 
@@ -253,7 +254,7 @@ contract DeferredAccrualTest is Test {
         vm.prank(alice);
         staker.userMigrate(address(usdc));
 
-        assertEq(phUSD.balanceOf(alice), 200 ether);
+        assertEq(antimatter.balanceOf(alice), 200 ether);
         assertEq(staker.unclaimedReward(address(usdc), alice), 0);
         assertEq(staker.claimableReward(address(usdc), alice), 0);
     }
@@ -311,11 +312,11 @@ contract DeferredAccrualTest is Test {
         uint256 expected = staker.claimableReward(address(usdc), alice);
         assertGt(expected, 0);
 
-        uint256 balBefore = phUSD.balanceOf(alice);
+        uint256 balBefore = antimatter.balanceOf(alice);
         vm.prank(alice);
         staker.claim(address(usdc));
 
-        assertEq(phUSD.balanceOf(alice) - balBefore, expected, "claim mints exactly claimableReward");
+        assertEq(antimatter.balanceOf(alice) - balBefore, expected, "claim mints exactly claimableReward");
         assertEq(staker.claimableReward(address(usdc), alice), 0, "reads zero straight after");
     }
 

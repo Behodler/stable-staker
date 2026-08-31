@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
 import "../src/CrossVersionMigrator.sol";
 import "../src/interfaces/IStableStakerMigratable.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
@@ -42,7 +42,7 @@ contract ProbelessStaker {
 ///         advisory version probe, the zero-credit skip, and the explicit absence of underwater
 ///         compensation.
 contract CrossVersionMigratorTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal oldStaker;
     StableStakerV2 internal newStaker;
     CrossVersionMigrator internal migrator;
@@ -60,19 +60,19 @@ contract CrossVersionMigratorTest is Test {
     );
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        oldStaker = new StableStakerV2(phUSD, owner);
-        newStaker = new StableStakerV2(phUSD, owner);
+        antimatter = new Antimatter(owner);
+        oldStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        newStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
 
-        // both instances may mint phUSD
-        phUSD.setMinter(address(oldStaker), true);
-        phUSD.setMinter(address(newStaker), true);
+        // both instances may mint antimatter
+        antimatter.setApprovedMinter(address(oldStaker), true);
+        antimatter.setApprovedMinter(address(newStaker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         oldStaker.addToken(address(usdc));
         newStaker.addToken(address(usdc));
-        oldStaker.phUSDPerDay(address(usdc), PER_DAY);
-        newStaker.phUSDPerDay(address(usdc), PER_DAY);
+        oldStaker.antimatterPerDay(address(usdc), PER_DAY);
+        newStaker.antimatterPerDay(address(usdc), PER_DAY);
 
         migrator = new CrossVersionMigrator(
             IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(newStaker)), owner
@@ -158,7 +158,7 @@ contract CrossVersionMigratorTest is Test {
         _stakeAliceAndBob();
 
         // A destination that was never `addToken`ed, but IS wired — so registration is what bites.
-        StableStakerV2 unregisteredDest = new StableStakerV2(phUSD, owner);
+        StableStakerV2 unregisteredDest = new StableStakerV2(IAntimatter(address(antimatter)), owner);
         CrossVersionMigrator preflight = new CrossVersionMigrator(
             IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(unregisteredDest)), owner
         );
@@ -258,10 +258,10 @@ contract CrossVersionMigratorTest is Test {
         assertEq(newTotal, 400e6);
         assertEq(usdc.balanceOf(address(newStaker)), 400e6);
 
-        // earned phUSD was minted to the users on the way out (story 022: pending + any
+        // earned antimatter was minted to the users on the way out (story 022: pending + any
         // `unclaimedReward` backlog; neither user booked one here)
-        assertEq(phUSD.balanceOf(alice), pendingAlice);
-        assertEq(phUSD.balanceOf(bob), pendingBob);
+        assertEq(antimatter.balanceOf(alice), pendingAlice);
+        assertEq(antimatter.balanceOf(bob), pendingBob);
         assertEq(oldStaker.unclaimedReward(address(usdc), alice), 0);
         assertEq(oldStaker.unclaimedReward(address(usdc), bob), 0);
 

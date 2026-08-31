@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
 import "../src/interfaces/IStableStaker.sol";
 import "../src/interfaces/IStableStakerMigratable.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// @notice The golden rule: EVERY version of `StableStaker` must expose `initiateMigration`,
@@ -22,7 +22,7 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 ///      parameter type — or dropped the leading `token` parameter for a one-pool redesign — would
 ///      change the selector and break migration silently at the call site; this catches that.
 contract GoldenRuleInterfaceTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
     MockERC20 internal usdc;
 
@@ -31,9 +31,9 @@ contract GoldenRuleInterfaceTest is Test {
     address internal alice = address(0xA11CE);
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(staker), true);
+        antimatter = new Antimatter(owner);
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         staker.addToken(address(usdc));

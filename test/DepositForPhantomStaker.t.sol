@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
@@ -20,7 +20,7 @@ import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 ///   require(credited > 0, "StableStaker: nothing credited");
 /// before any state mutation, preventing the phantom from ever being created.
 contract DepositForPhantomStakerTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
     MockERC20 internal dai;
     MockYieldStrategy internal strategy;
@@ -34,9 +34,9 @@ contract DepositForPhantomStakerTest is Test {
     uint256 internal constant REAL_STAKE = 100 ether;
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(staker), true);
+        antimatter = new Antimatter(owner);
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(staker), true);
 
         dai = new MockERC20("Dai", "DAI", 18);
         staker.addToken(address(dai));

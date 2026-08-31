@@ -7,7 +7,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
-import "flax-token/IFlax.sol";
+import "./interfaces/IAntimatter.sol";
 import "pauser/interfaces/IPausable.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import "./interfaces/IStableStaker.sol";
@@ -15,24 +15,24 @@ import "./interfaces/IStableStaker.sol";
 /**
  * @title StableStakerV2
  * @notice A MasterChef-style yield farm that supports any number of staked (stable) tokens and
- *         rewards stakers in phUSD. Unlike a classic MasterChef, rewards are not paid from a
- *         pre-funded balance: the contract is an authorized minter of phUSD and mints rewards
+ *         rewards stakers in Antimatter. Unlike a classic MasterChef, rewards are not paid from a
+ *         pre-funded balance: the contract is an approved minter of Antimatter and mints rewards
  *         directly to users on claim / withdraw / migration.
  *
  * @dev Reward accounting is the canonical per-pool MasterChef model, one pool per token:
  *
- *        accPhusdPerShare += elapsed * phusdPerSecond * ACC_PRECISION / totalStaked
- *        pending(user)     = user.amount * accPhusdPerShare / ACC_PRECISION - user.rewardDebt
+ *        accAntimatterPerShare += elapsed * antimatterPerSecond * ACC_PRECISION / totalStaked
+ *        pending(user)     = user.amount * accAntimatterPerShare / ACC_PRECISION - user.rewardDebt
  *
- *      Emission-cap invariant (the core safety property): the only writer of `accPhusdPerShare`
- *      is {_updatePool}, which folds in exactly `elapsed * phusdPerSecond` of value per update.
+ *      Emission-cap invariant (the core safety property): the only writer of `accAntimatterPerShare`
+ *      is {_updatePool}, which folds in exactly `elapsed * antimatterPerSecond` of value per update.
  *      The sum of every staker's pending increase therefore equals that amount minus
  *      integer-division dust, *independent of how stake is split or churned*. Consequences:
  *        - flash staking (stake + exit in one block) yields elapsed == 0 -> 0 reward;
  *        - windows where `totalStaked == 0` accrue nothing (lastRewardTime is fast-forwarded);
- *        - dust always rounds DOWN, so realized emission <= phusdPerSecond * elapsed.
- *      Hence no sequence of user actions can mint more than `phUSDPerDay` for a token over any
- *      window. {phUSDPerDay} settles the pool at the old rate before changing it, so a rate
+ *        - dust always rounds DOWN, so realized emission <= antimatterPerSecond * elapsed.
+ *      Hence no sequence of user actions can mint more than `antimatterPerDay` for a token over any
+ *      window. {antimatterPerDay} settles the pool at the old rate before changing it, so a rate
  *      change is never applied retroactively.
  *
  *      Pausing follows the Behodler3 pattern (OZ {Pausable} + {IPausable}): a dedicated `pauser`
@@ -43,7 +43,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
 
-    /// @notice Fixed-point scaling factor for `accPhusdPerShare`. Dust rounds down.
+    /// @notice Fixed-point scaling factor for `accAntimatterPerShare`. Dust rounds down.
     uint256 public constant ACC_PRECISION = 1e18;
 
     /// @notice Seconds in a day, used to convert a per-day budget into a per-second rate.
@@ -56,8 +56,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     ///      `STAKER_VERSION` means version 1.
     uint256 public constant STAKER_VERSION = 2;
 
-    /// @notice The phUSD reward token. This contract must be an authorized minter on it.
-    IFlax public immutable phUSD;
+    /// @notice The Antimatter reward token. This contract must be an approved minter on it.
+    IAntimatter public immutable antimatter;
 
     /// @notice Address authorized to pause the contract (Behodler3 pattern). Satisfies IPausable.
     address public override pauser;
@@ -67,8 +67,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
     /// @notice Per-token reward pool accounting.
     struct PoolInfo {
-        uint256 phusdPerSecond; // current emission rate (phUSD wei per second)
-        uint256 accPhusdPerShare; // accumulated phUSD per staked unit, scaled by ACC_PRECISION
+        uint256 antimatterPerSecond; // current emission rate (Antimatter wei per second)
+        uint256 accAntimatterPerShare; // accumulated Antimatter per staked unit, scaled by ACC_PRECISION
         uint256 lastRewardTime; // last time the pool accrued
         uint256 totalStaked; // total principal staked in this pool
     }
@@ -76,7 +76,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     /// @notice Per-user position within a pool.
     struct UserInfo {
         uint256 amount; // staked principal
-        uint256 rewardDebt; // accounting baseline: amount * accPhusdPerShare / ACC_PRECISION at last settle
+        uint256 rewardDebt; // accounting baseline: amount * accAntimatterPerShare / ACC_PRECISION at last settle
     }
 
     /// @notice token => pool accounting.
@@ -88,7 +88,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     /// @notice token => enumerable set of addresses currently holding a non-zero position.
     mapping(address => EnumerableSet.AddressSet) private _stakers;
 
-    /// @notice token => user => settled-but-unminted phUSD reward, claimable via {claim}.
+    /// @notice token => user => settled-but-unminted Antimatter reward, claimable via {claim}.
     /// @dev Written only by {_settle}, {withdraw} and the terminal-migration exit; drained to zero by
     ///      {claim}, {emergencyWithdraw} (forfeit) and {_exitPosition} (paid out). A standalone mapping
     ///      rather than a third {UserInfo} field, so the public `userInfo` getter keeps its 2-tuple
@@ -137,7 +137,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     // ============================== EVENTS ==============================
 
     event TokenAdded(address indexed token);
-    event RewardRateSet(address indexed token, uint256 phusdPerDay, uint256 phusdPerSecond);
+    event RewardRateSet(address indexed token, uint256 antimatterAmountPerDay, uint256 antimatterPerSecond);
     event MigratorSet(address indexed migrator);
     event PauserUpdated(address indexed oldPauser, address indexed newPauser);
     event YieldStrategySet(address indexed token, address indexed oldStrategy, address indexed newStrategy);
@@ -188,12 +188,12 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     // ============================== CONSTRUCTOR ==============================
 
     /**
-     * @param _phUSD       The phUSD token this farm mints as rewards.
+     * @param _antimatter  The Antimatter token this farm mints as rewards.
      * @param initialOwner The owner (can register tokens, set rates, migrator and pauser).
      */
-    constructor(IFlax _phUSD, address initialOwner) Ownable(initialOwner) {
-        require(address(_phUSD) != address(0), "StableStaker: zero phUSD");
-        phUSD = _phUSD;
+    constructor(IAntimatter _antimatter, address initialOwner) Ownable(initialOwner) {
+        require(address(_antimatter) != address(0), "StableStaker: zero antimatter");
+        antimatter = _antimatter;
     }
 
     // ============================== OWNER CONFIG ==============================
@@ -207,14 +207,14 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     }
 
     /**
-     * @notice Set the daily phUSD emission budget for a token. Internally converted to a
+     * @notice Set the daily Antimatter emission budget for a token. Internally converted to a
      *         per-second rate (`amountPerDay / SECONDS_PER_DAY`, rounded down). The pool is
      *         settled at the existing rate first so the change never applies retroactively.
      */
-    function phUSDPerDay(address token, uint256 amountPerDay) external onlyOwner poolExists(token) {
+    function antimatterPerDay(address token, uint256 amountPerDay) external onlyOwner poolExists(token) {
         _updatePool(token);
         uint256 perSecond = amountPerDay / SECONDS_PER_DAY;
-        poolInfo[token].phusdPerSecond = perSecond;
+        poolInfo[token].antimatterPerSecond = perSecond;
         emit RewardRateSet(token, amountPerDay, perSecond);
     }
 
@@ -333,13 +333,13 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         require(credited > 0, "StableStaker: nothing credited");
         user.amount += credited;
         pool.totalStaked += credited;
-        user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
+        user.rewardDebt = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION;
         _stakers[token].add(msg.sender);
         emit Staked(token, msg.sender, credited);
     }
 
     /// @notice Withdraw `amount` of staked `token`. Any pending reward is booked to {unclaimedReward}
-    ///         rather than minted, so principal handling never depends on phUSD being mintable.
+    ///         rather than minted, so principal handling never depends on Antimatter being mintable.
     function withdraw(address token, uint256 amount) external nonReentrant whenNotPaused poolExists(token) {
         require(amount > 0, "StableStaker: amount=0");
         // Frozen once terminal migration is engaged: exits go through {userMigrate}, which honours the
@@ -350,10 +350,10 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         require(user.amount >= amount, "StableStaker: insufficient stake");
         _updatePool(token);
 
-        uint256 pending = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION - user.rewardDebt;
+        uint256 pending = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION - user.rewardDebt;
         user.amount -= amount;
         pool.totalStaked -= amount;
-        user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
+        user.rewardDebt = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION;
         if (user.amount == 0) {
             _stakers[token].remove(msg.sender);
         }
@@ -368,7 +368,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         emit Withdrawn(token, msg.sender, amount);
     }
 
-    /// @notice Mint the caller's phUSD reward for `token` without touching principal: the
+    /// @notice Mint the caller's Antimatter reward for `token` without touching principal: the
     ///         settled-but-unminted {unclaimedReward} backlog plus anything freshly pending. This is
     ///         the only user-facing path that mints, and {claimableReward} reads the figure it pays.
     /// @dev Succeeds for a caller with no position but a non-zero backlog (someone who fully withdrew
@@ -377,12 +377,12 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage user = userInfo[token][msg.sender];
-        uint256 pending = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION - user.rewardDebt;
+        uint256 pending = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION - user.rewardDebt;
         uint256 owed = unclaimedReward[token][msg.sender] + pending;
         require(owed > 0, "StableStaker: nothing to claim");
         unclaimedReward[token][msg.sender] = 0;
-        user.rewardDebt = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION;
-        phUSD.mint(msg.sender, owed);
+        user.rewardDebt = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION;
+        antimatter.mint(msg.sender, owed);
         emit Claimed(token, msg.sender, owed);
     }
 
@@ -459,7 +459,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
      *      {finalizeAndReset}, gated on a fully-drained pool.
      *
      *      Emissions are settled to this block and then frozen ({_updatePool} no-ops while Migrating), so
-     *      every user's pending phUSD is fixed at the snapshot and is minted in full on their exit.
+     *      every user's pending Antimatter is fixed at the snapshot and is minted in full on their exit.
      * @param token The staked token to put into terminal migration. Must be a registered pool and not
      *              already migrating.
      */
@@ -467,7 +467,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
 
         // Settle rewards to this block; subsequent _updatePool calls are frozen once Migrating is set,
-        // so pending phUSD is now fixed at the snapshot for every migrating user.
+        // so pending Antimatter is now fixed at the snapshot for every migrating user.
         _updatePool(token);
 
         // P: the immutable principal denominator. Held in lockstep with strategy.principalOf, so passing
@@ -531,7 +531,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         // buffer, dust and donations already sitting here, so a below-par exit is softened before any
         // user is haircut — audit-14 ss14l8. All liquid value up to par is paid to users; anything
         // above par stays protocol-owned in the now-decoupled strategy, so the "stakers get principal
-        // + phUSD only" invariant holds. Computed after the reconciliation block so the code reads in
+        // + Antimatter only" invariant holds. Computed after the reconciliation block so the code reads in
         // the order the reasoning runs (relinquishPrincipal moves no tokens, so it cannot affect this
         // balance either way). min(R, P) at the credit site is now redundant but is kept as cheap
         // defence against a stray donation arriving between here and the last userMigrate.
@@ -547,7 +547,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     /**
      * @notice Permissioned batched exit during terminal migration (see {IStableStaker-batchMigrate}).
      *         Replaces the legacy `migrateOut`. For each non-zero user: mints their frozen pending
-     *         phUSD, zeroes their position, and accumulates the snapshot credit `p_i·min(R,P)/P`. The
+     *         Antimatter, zeroes their position, and accumulates the snapshot credit `p_i·min(R,P)/P`. The
      *         aggregate is transferred to the migrator from the idle pile; the migrator redeposits each
      *         per-user credit into the new staker.
      * @dev Permission: `onlyMigrator`. Requires a prior {initiateMigration} (`active`). No `_routeExit`,
@@ -586,7 +586,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     }
 
     /**
-     * @dev Shared terminal-migration exit for one user: mints their frozen pending phUSD PLUS any
+     * @dev Shared terminal-migration exit for one user: mints their frozen pending Antimatter PLUS any
      *      {unclaimedReward} backlog (terminal exit settles everything owed), computes the
      *      snapshot credit `p_i·min(R,P)/P`, zeroes their position and removes them from the staker set.
      *      Returns the credit (0 for an empty position). Used by both {batchMigrate} and {userMigrate},
@@ -606,7 +606,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
         // Pending was frozen at the snapshot (_updatePool is a no-op while active).
         PoolInfo storage pool = poolInfo[token];
-        uint256 pending = (amt * pool.accPhusdPerShare) / ACC_PRECISION - info.rewardDebt;
+        uint256 pending = (amt * pool.accAntimatterPerShare) / ACC_PRECISION - info.rewardDebt;
 
         uint256 owed = unclaimedReward[token][account] + pending;
 
@@ -617,7 +617,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         _stakers[token].remove(account);
 
         if (owed > 0) {
-            phUSD.mint(account, owed);
+            antimatter.mint(account, owed);
         }
         emit MigratedOut(token, account, credit, owed);
     }
@@ -713,14 +713,14 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         require(credited > 0, "StableStaker: nothing credited");
         info.amount += credited;
         pool.totalStaked += credited;
-        info.rewardDebt = (info.amount * pool.accPhusdPerShare) / ACC_PRECISION;
+        info.rewardDebt = (info.amount * pool.accAntimatterPerShare) / ACC_PRECISION;
         _stakers[token].add(user);
         emit DepositedFor(token, user, credited);
     }
 
     // ============================== VIEWS ==============================
 
-    /// @notice Projected pending phUSD reward for `account` in `token`'s pool — the LIVE PROJECTION
+    /// @notice Projected pending Antimatter reward for `account` in `token`'s pool — the LIVE PROJECTION
     ///         ONLY, measured against `rewardDebt`.
     /// @dev Deliberately EXCLUDES the settled-but-unminted {unclaimedReward} backlog, so its meaning is
     ///      byte-identical to the frozen V1 function of the same name (V1 is permanently deployed and
@@ -732,7 +732,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         return _pendingReward(token, account);
     }
 
-    /// @notice Total phUSD `account` could mint from `token`'s pool right now: the settled-but-unminted
+    /// @notice Total Antimatter `account` could mint from `token`'s pool right now: the settled-but-unminted
     ///         {unclaimedReward} backlog plus the live projection returned by {pendingReward}.
     /// @dev This is the figure {claim} pays. {pendingReward} deliberately excludes the backlog so its
     ///      meaning stays identical to the frozen V1 function of the same name.
@@ -744,10 +744,10 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     ///      the identical value {pendingReward} always returned, for every input.
     function _pendingReward(address token, address account) internal view returns (uint256) {
         PoolInfo storage pool = poolInfo[token];
-        uint256 acc = pool.accPhusdPerShare;
+        uint256 acc = pool.accAntimatterPerShare;
         if (poolState[token] == PoolState.Active && block.timestamp > pool.lastRewardTime && pool.totalStaked > 0) {
             uint256 elapsed = block.timestamp - pool.lastRewardTime;
-            uint256 reward = elapsed * pool.phusdPerSecond;
+            uint256 reward = elapsed * pool.antimatterPerSecond;
             acc += (reward * ACC_PRECISION) / pool.totalStaked;
         }
         UserInfo storage user = userInfo[token][account];
@@ -804,7 +804,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
     /// @dev Accrue rewards for `token` up to the current block. Empty pools accrue nothing.
     function _updatePool(address token) internal {
-        // Emissions are frozen once terminal migration is engaged: each user's pending phUSD stays
+        // Emissions are frozen once terminal migration is engaged: each user's pending Antimatter stays
         // fixed at the {initiateMigration} snapshot, so it is minted in full on their migration exit.
         // See TERMINAL MIGRATION.
         if (poolState[token] != PoolState.Active) {
@@ -819,19 +819,19 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
             return;
         }
         uint256 elapsed = block.timestamp - pool.lastRewardTime;
-        uint256 reward = elapsed * pool.phusdPerSecond;
+        uint256 reward = elapsed * pool.antimatterPerSecond;
         if (reward > 0) {
-            pool.accPhusdPerShare += (reward * ACC_PRECISION) / pool.totalStaked;
+            pool.accAntimatterPerShare += (reward * ACC_PRECISION) / pool.totalStaked;
         }
         pool.lastRewardTime = block.timestamp;
     }
 
     /// @dev Book any outstanding pending reward for an existing position to {unclaimedReward}, where
-    ///      {claim} will mint it. Never calls phUSD, so a revoked minter role cannot brick the
+    ///      {claim} will mint it. Never calls Antimatter, so a revoked minter role cannot brick the
     ///      principal paths that reach here. Assumes pool is current.
     function _settle(address token, address account, UserInfo storage user, PoolInfo storage pool) internal {
         if (user.amount > 0) {
-            uint256 pending = (user.amount * pool.accPhusdPerShare) / ACC_PRECISION - user.rewardDebt;
+            uint256 pending = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION - user.rewardDebt;
             if (pending > 0) {
                 unclaimedReward[token][account] += pending;
             }

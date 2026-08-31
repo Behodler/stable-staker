@@ -3,12 +3,12 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
-/// @notice The safety spec: no sequence of user actions can mint more than phUSDPerDay for a token.
+/// @notice The safety spec: no sequence of user actions can mint more than antimatterPerDay for a token.
 contract EmissionCapTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
     MockERC20 internal usdc;
 
@@ -19,12 +19,12 @@ contract EmissionCapTest is Test {
     uint256 internal constant PER_DAY = 86_400 ether; // 1e18 / second
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(staker), true);
+        antimatter = new Antimatter(owner);
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(staker), true);
         usdc = new MockERC20("USD Coin", "USDC", 6);
         staker.addToken(address(usdc));
-        staker.phUSDPerDay(address(usdc), PER_DAY);
+        staker.antimatterPerDay(address(usdc), PER_DAY);
         _fund(alice);
         _fund(bob);
     }
@@ -52,8 +52,8 @@ contract EmissionCapTest is Test {
         _stake(alice, 123_456e6);
         vm.warp(block.timestamp + 1 days);
         _claim(alice);
-        assertLe(phUSD.balanceOf(alice), PER_DAY); // hard cap
-        assertApproxEqAbs(phUSD.balanceOf(alice), PER_DAY, 1e9); // ~all of it (dust only)
+        assertLe(antimatter.balanceOf(alice), PER_DAY); // hard cap
+        assertApproxEqAbs(antimatter.balanceOf(alice), PER_DAY, 1e9); // ~all of it (dust only)
     }
 
     // With a stake size that divides the emission evenly, a sole staker mints EXACTLY perDay.
@@ -61,7 +61,7 @@ contract EmissionCapTest is Test {
         _stake(alice, 100e6);
         vm.warp(block.timestamp + 1 days);
         _claim(alice);
-        assertEq(phUSD.balanceOf(alice), PER_DAY);
+        assertEq(antimatter.balanceOf(alice), PER_DAY);
     }
 
     // Two stakers over a full day: their combined minted amount never exceeds the budget.
@@ -71,7 +71,7 @@ contract EmissionCapTest is Test {
         vm.warp(block.timestamp + 1 days);
         _claim(alice);
         _claim(bob);
-        uint256 total = phUSD.balanceOf(alice) + phUSD.balanceOf(bob);
+        uint256 total = antimatter.balanceOf(alice) + antimatter.balanceOf(bob);
         assertLe(total, PER_DAY); // hard cap
         assertApproxEqAbs(total, PER_DAY, 1e6); // and essentially all of it (only rounding dust lost)
     }
@@ -83,7 +83,7 @@ contract EmissionCapTest is Test {
         assertEq(staker.pendingReward(address(usdc), alice), 0);
         vm.prank(alice);
         staker.withdraw(address(usdc), 1_000e6);
-        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(antimatter.balanceOf(alice), 0);
     }
 
     // Time elapsed while the pool is empty mints nothing; only post-stake time accrues.
@@ -99,7 +99,7 @@ contract EmissionCapTest is Test {
     function test_rateChange_notRetroactive() public {
         _stake(alice, 100e6);
         vm.warp(block.timestamp + 100); // 100s at 1e18/s
-        staker.phUSDPerDay(address(usdc), PER_DAY * 5); // -> 5e18/s, settles old rate first
+        staker.antimatterPerDay(address(usdc), PER_DAY * 5); // -> 5e18/s, settles old rate first
         vm.warp(block.timestamp + 100); // 100s at 5e18/s
         // 100*1e18 + 100*5e18 = 600e18
         assertEq(staker.pendingReward(address(usdc), alice), 600 ether);
@@ -107,7 +107,7 @@ contract EmissionCapTest is Test {
 
     // Cap holds across heavy churn: cumulative minted over N days <= N * perDay.
     function test_emissionCap_holdsUnderChurn() public {
-        uint256 startMinted = phUSD.totalSupply();
+        uint256 startMinted = antimatter.totalSupply();
         uint256 startTime = block.timestamp;
 
         _stake(alice, 50e6);
@@ -127,7 +127,7 @@ contract EmissionCapTest is Test {
         _stake(alice, 1e6);
 
         uint256 elapsed = block.timestamp - startTime;
-        uint256 minted = phUSD.totalSupply() - startMinted;
+        uint256 minted = antimatter.totalSupply() - startMinted;
         uint256 cap = elapsed * (PER_DAY / 1 days); // perSecond * elapsed
         assertLe(minted, cap);
 
@@ -138,11 +138,11 @@ contract EmissionCapTest is Test {
         assertGt(unclaimed, 0, "the churn really did book a backlog");
         assertLe(unclaimed + minted, cap, "accrued (minted + booked) never exceeds the emission cap");
 
-        // And draining the whole backlog to phUSD still respects the cap. Bob exited fully inside the
+        // And draining the whole backlog to antimatter still respects the cap. Bob exited fully inside the
         // loop and claimed each round, so alice holds all of it.
         assertEq(staker.unclaimedReward(address(usdc), bob), 0);
         _claim(alice);
         assertEq(staker.unclaimedReward(address(usdc), alice), 0);
-        assertLe(phUSD.totalSupply() - startMinted, cap);
+        assertLe(antimatter.totalSupply() - startMinted, cap);
     }
 }

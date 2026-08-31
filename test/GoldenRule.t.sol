@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
 import "../src/interfaces/IStableStakerMigratable.sol";
 import "../src/versions/v1/IStableStakerV1.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// @notice THE GOLDEN RULE, pinned at the ABI level: every version of {StableStaker} — past,
@@ -35,7 +35,7 @@ contract GoldenRuleTest is Test {
     bytes4 internal constant BATCH_MIGRATE_SELECTOR = 0x0ad9aeb9;
     bytes4 internal constant DEPOSIT_FOR_SELECTOR = 0xb3db428b;
 
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
     MockERC20 internal usdc;
 
@@ -44,9 +44,9 @@ contract GoldenRuleTest is Test {
     address internal alice = address(0xA11CE);
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(staker), true);
+        antimatter = new Antimatter(owner);
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         staker.addToken(address(usdc));

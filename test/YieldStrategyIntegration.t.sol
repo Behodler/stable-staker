@@ -3,14 +3,14 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 
 /// @notice Integration tests for routing staked principal through a per-token IYieldStrategy.
 contract YieldStrategyIntegrationTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
     MockERC20 internal usdc; // 6 decimals
     MockYieldStrategy internal strategy;
@@ -21,7 +21,7 @@ contract YieldStrategyIntegrationTest is Test {
     address internal bob = address(0xB0B);
     address internal faucet = address(0xFA0CE7);
 
-    uint256 internal constant PER_DAY = 86_400 ether; // -> 1e18 phUSD per second
+    uint256 internal constant PER_DAY = 86_400 ether; // -> 1e18 antimatter per second
 
     event YieldStrategySet(address indexed token, address indexed oldStrategy, address indexed newStrategy);
     event BufferWithdrawn(address indexed token, address indexed user, uint256 amount);
@@ -29,13 +29,13 @@ contract YieldStrategyIntegrationTest is Test {
     event ProtocolPrincipalSwept(address indexed token, address indexed strategy, uint256 amount, uint256 credited);
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(staker), true);
+        antimatter = new Antimatter(owner);
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         staker.addToken(address(usdc));
-        staker.phUSDPerDay(address(usdc), PER_DAY);
+        staker.antimatterPerDay(address(usdc), PER_DAY);
         staker.setMigrator(migrator);
 
         strategy = new MockYieldStrategy();
@@ -74,7 +74,7 @@ contract YieldStrategyIntegrationTest is Test {
         staker.withdraw(address(usdc), 40e6);
         assertEq(usdc.balanceOf(alice), balBefore + 40e6);
         // Story 022: booked, not minted, on withdraw.
-        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(antimatter.balanceOf(alice), 0);
         assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 60e6);
@@ -172,7 +172,7 @@ contract YieldStrategyIntegrationTest is Test {
 
         assertEq(usdc.balanceOf(alice), balBefore + 40e6);
         // Story 022: identical reward math, booked to `unclaimedReward` instead of minted.
-        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(antimatter.balanceOf(alice), 0);
         assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 60e6);
@@ -480,7 +480,7 @@ contract YieldStrategyIntegrationTest is Test {
         staker.emergencyWithdraw(address(usdc));
 
         assertEq(usdc.balanceOf(alice), balBefore + 90e6); // 10% haircut
-        assertEq(phUSD.balanceOf(alice), 0); // reward forfeited
+        assertEq(antimatter.balanceOf(alice), 0); // reward forfeited
         assertEq(staker.unclaimedReward(address(usdc), alice), 0); // story 022: backlog forfeited too
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
         assertEq(amount, 0);

@@ -44,7 +44,7 @@ interface IStableStakerMigratable {
 
     /**
      * @notice Permissioned, batched terminal-migration exit (replaces the legacy `migrateOut`).
-     *         For each user: mints their frozen pending phUSD, zeroes their position and removes them
+     *         For each user: mints their frozen pending reward, zeroes their position and removes them
      *         from the staker set. The aggregate snapshot credit is transferred to the caller (the
      *         migrator). Requires a prior {initiateMigration}.
      * @param token  The staked token whose positions are being migrated out.

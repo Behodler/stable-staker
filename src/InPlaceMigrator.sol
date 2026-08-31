@@ -50,7 +50,7 @@ import "./interfaces/IStableStaker.sol";
  *      `migrateOut`. The delay is intentional: it gives the operator an uninterrupted window to
  *      finish the rewire while still guaranteeing that if the operator is incapacitated / loses keys
  *      / keys are compromised, every parked user can eventually recover their PRINCIPAL unilaterally.
- *      Earned phUSD was already minted to the user at `migrateOut` (inside the staker's
+ *      Earned reward was already minted to the user at `migrateOut` (inside the staker's
  *      `batchMigrate`), so the hatch returns PRINCIPAL ONLY.
  *
  *      Scoped for a small staker set, a single batch, and a short window. Not built for long-running,
@@ -153,7 +153,7 @@ contract InPlaceMigrator is Ownable, ReentrancyGuard {
 
     /**
      * @notice Drain a batch of users out of the staker and PARK their principal in this migrator's
-     *         custody. The staker mints each user's frozen earned phUSD during `batchMigrate` and
+     *         custody. The staker mints each user's frozen earned reward during `batchMigrate` and
      *         `safeTransfer`s the aggregate snapshot credit to this contract; we record it per-user.
      * @dev Requires a prior {initiateMigration} for `token` (the staker reverts otherwise). Idempotent
      *      by construction: `batchMigrate` zeroes the source position, so a re-run returns `0` for an
@@ -299,7 +299,7 @@ contract InPlaceMigrator is Ownable, ReentrancyGuard {
     /**
      * @notice Permissionless, self-only escape hatch: a parked user reclaims THEIR OWN principal once
      *         `migrationTimeout` has elapsed since their `migrateOut`.
-     * @dev (F) Returns PRINCIPAL ONLY — earned phUSD was already minted to the user at `migrateOut`.
+     * @dev (F) Returns PRINCIPAL ONLY — the earned reward was already minted to the user at `migrateOut`.
      *      Strict CEI under `nonReentrant`: all state is cleared BEFORE the transfer, so a malicious
      *      token callback cannot re-enter to double-claim (the second entry sees `parked == 0`).
      * @param token The token whose parked principal the caller is reclaiming.

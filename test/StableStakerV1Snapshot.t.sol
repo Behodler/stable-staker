@@ -108,7 +108,7 @@ contract StableStakerV1SnapshotTest is Test {
     ///      bend `StableStakerV2` to keep it compiling, and never edit the frozen interface. The
     ///      binding fidelity subject is `StableStakerV1`, exercised by every other test in this file.
     function test_NONBINDING_v2StillOverlapsV1Abi() public {
-        StableStakerV2 v2Impl = new StableStakerV2(phUSD, owner);
+        StableStakerV2 v2Impl = new StableStakerV2(IAntimatter(address(phUSD)), owner);
         IStableStakerV1 v2AsV1 = IStableStakerV1(address(v2Impl));
         assertEq(address(v2AsV1), address(v2Impl), "V2 currently still casts to the V1 surface");
         assertEq(v2AsV1.ACC_PRECISION(), 1e18, "overlapping member must dispatch on V2 too");

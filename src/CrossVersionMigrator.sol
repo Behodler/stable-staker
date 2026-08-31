@@ -9,7 +9,7 @@ import "./interfaces/IStableStakerMigratable.sol";
 /**
  * @title CrossVersionMigrator
  * @notice Moves a user base between ANY two versions of {StableStaker} — V1 to V2, V2 to V3 and
- *         onward — with zero user action, preserving principal and minting each user's earned phUSD.
+ *         onward — with zero user action, preserving principal and minting each user's earned reward token.
  *
  * @dev SUPERSEDES the original cross-staker migrator, which was removed in story 018 and remains
  *      recoverable from git history (see CLAUDE.md). This contract is a strict functional superset
@@ -32,7 +32,8 @@ import "./interfaces/IStableStakerMigratable.sol";
  *
  *      (C) TWO-SIDED WIRING IS REQUIRED BEFORE USE. This migrator must be set as `migrator` via
  *      `setMigrator` on BOTH stakers, the destination staker must already have the token registered
- *      (`addToken`), and the destination staker must be an authorized phUSD minter. Because both
+ *      (`addToken`), and the destination staker must be an authorized minter of the destination's reward token
+ *      (phUSD on the frozen V1, Antimatter on V2 and onward). Because both
  *      targets are immutable there is no in-place retarget: a different pair of stakers is a new
  *      deployment of this contract, re-wired on both sides.
  *
@@ -51,8 +52,9 @@ import "./interfaces/IStableStakerMigratable.sol";
  *
  *      What remains a RUNBOOK OBLIGATION, unguarded and uncheckable from here:
  *
- *        - phUSD minter authorization on the destination. That permission lives on the `FlaxToken`,
- *          which this contract holds no reference to and deliberately does not import (section (A)).
+ *        - reward-token minter authorization on the destination. That permission lives on the reward
+ *          token itself (`FlaxToken` for the frozen V1, `Antimatter` for V2 and onward), which this
+ *          contract holds no reference to and deliberately does not import (section (A)).
  *        - source-side `setMigrator`. The live V1 is deployed and unpatchable, and nothing this
  *          contract can do protects against the SOURCE being mis-wired; that still fails only at
  *          call time.
@@ -73,7 +75,7 @@ import "./interfaces/IStableStakerMigratable.sol";
  *      user whose snapshot credit floors to 0 would therefore revert an entire batch. The
  *      `if (amounts[i] > 0)` guard below skips those users so the batch survives — the open item
  *      L-01 / `ss12l1` dust interaction recorded by story 013. A skipped user is still fully exited
- *      from the old staker by `batchMigrate` (their pending phUSD was minted to them there); what
+ *      from the old staker by `batchMigrate` (their pending reward was minted to them there); what
  *      they forgo is a zero-value principal credit on the destination, and their floor-division dust
  *      accrues to the protocol in the old staker. The alternative — requiring batches to be
  *      pre-filtered off-chain — was rejected as a landmine.
@@ -139,7 +141,7 @@ contract CrossVersionMigrator is Ownable {
      *      PRE-FLIGHT. Because the forwarded call is irreversible on the source, the two
      *      destination-side preconditions that CAN be read on chain are asserted first — see section
      *      (C). Both are advisory when the destination does not expose the probed getter; neither
-     *      covers the phUSD-minter precondition or the source side's own `setMigrator`.
+     *      covers the reward-token-minter precondition or the source side's own `setMigrator`.
      * @param token The staked token to put into terminal migration on the old staker.
      */
     function initiateMigration(address token) external onlyOwner {

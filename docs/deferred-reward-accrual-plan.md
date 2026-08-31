@@ -1,4 +1,4 @@
-# Deferred phUSD reward accrual
+# Deferred reward accrual
 
 **Status: IMPLEMENTED** — shipped by story-022 on `sprint/no-auto-claim`.
 Originally drafted 2026-08-23 as "proposed, not implemented"; re-anchored to
@@ -9,10 +9,16 @@ Originally drafted 2026-08-23 as "proposed, not implemented"; re-anchored to
 > Every file and line reference below is against the current `src/StableStakerV2.sol`.
 > **V2 only** — `src/versions/v1/` is frozen, hash-pinned by `FROZEN.sha256`, reproduces the live
 > mainnet instance `0xbce8ABC09BaEDCabE93419bF875f6186e182079A`, and keeps immediate payout.
+>
+> **Emissions-token note (story 023).** This plan was written while V2 still emitted phUSD. V2 now
+> emits **Antimatter** (`src/interfaces/IAntimatter.sol`, concrete token in `lib/antimatter`); the
+> frozen V1 keeps emitting phUSD forever. The mechanics below are unchanged by that swap — only the
+> token, the identifier names (`accAntimatterPerShare`, `antimatterPerSecond`, `antimatterPerDay`)
+> and the minter-authorization call (`setApprovedMinter` rather than `setMinter`) differ.
 
 ## 1. What changed
 
-`StableStakerV2` no longer mints phUSD as a side effect of principal movement. Pending reward is
+`StableStakerV2` no longer mints its reward token as a side effect of principal movement. Pending reward is
 **booked** to a per-user unpaid balance and minted only on an explicit `claim`, or at the terminal
 migration exit.
 
@@ -26,13 +32,14 @@ mapping(address => mapping(address => uint256)) public unclaimedReward; // line 
 
 ## 2. Why
 
-The headline win is **robustness**. Before this change a revoked minter role — or any phUSD revert
+The headline win is **robustness**. Before this change a revoked minter role — or any reward-token revert
 — bricked `stake` and `withdraw` outright, pushing users onto `emergencyWithdraw` and forfeiting
-their rewards. The principal paths now never call phUSD at all, so phUSD availability can neither
+their rewards. The principal paths now never call the reward token at all, so its availability can neither
 trap nor degrade principal handling. It also removes an external call from the middle of
 `withdraw`, which previously minted before routing the exit.
 
-Secondarily, it is preparation for a coming overhaul of phUSD minting: principal movement is now
+Secondarily, it is preparation for a coming overhaul of emissions minting — story 023 moved V2 onto
+Antimatter: principal movement is now
 decoupled from the mint call.
 
 ## 3. Call sites
@@ -47,7 +54,7 @@ decoupled from the mint call.
 | 696 | `depositFor` | settles via `_settle`; otherwise unchanged |
 | 832 | `_settle` | takes `token`, books instead of minting (line 836) |
 
-Exactly two `phUSD.mint(` call sites remain, both on explicit-payout paths: `claim` and
+Exactly two `antimatter.mint(` call sites remain, both on explicit-payout paths: `claim` and
 `_exitPosition`. There were four before.
 
 `claim` now succeeds for a user with `amount == 0` and a non-zero backlog (someone who fully
@@ -96,10 +103,10 @@ members, and both interface files are byte-unchanged by this work.
 
 ## 6. Why the emission cap still holds
 
-The cap invariant lives entirely in `_updatePool` / `accPhusdPerShare` and is untouched. Payout
+The cap invariant lives entirely in `_updatePool` / `accAntimatterPerShare` and is untouched. Payout
 timing is strictly downstream of accrual:
 
-- No new path writes `accPhusdPerShare`.
+- No new path writes `accAntimatterPerShare`.
 - Per-user owed amounts are computed by the same formula, at the same moments.
 - Cumulative **minted** becomes `<=` cumulative **accrued** rather than approximately equal to it.
 
@@ -118,7 +125,7 @@ The cap therefore holds *a fortiori*. The statement that now carries the invaria
 | Does `MigratedOut.reward` change? | **Yes, silently.** It carries `pending + unclaimed` rather than `pending`. Off-chain consumers will read a different number. |
 
 Known downside carried deliberately: deferral builds an unbounded off-schedule mint liability
-realisable all at once. That is a phUSD peg / market-depth concern, not a solvency one, and is what
+realisable all at once. That is a reward-token market-depth concern, not a solvency one, and is what
 the coming minting overhaul addresses.
 
 ## 8. Tests

@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 
 /// @notice Version identity for the evergreen `StableStakerV2`.
 ///
@@ -16,15 +16,15 @@ import "flax-token/FlaxToken.sol";
 /// instance (0xbce8ABC09BaEDCabE93419bF875f6186e182079A) predates the constant and does not expose
 /// it. That is also why the frozen `src/versions/v1/StableStakerV1.sol` must never gain the getter.
 contract StakerVersionTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
 
     /// @dev The selector any cross-version probe will use against an unknown staker.
     bytes internal constant VERSION_CALLDATA = abi.encodeWithSignature("STAKER_VERSION()");
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, address(this));
+        antimatter = new Antimatter(address(this));
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), address(this));
     }
 
     /// @notice The source is version 2: V1 is what is deployed, and the constant's existence is
@@ -49,9 +49,9 @@ contract StakerVersionTest is Test {
     /// @notice A contract without the getter reverts rather than returning 0. A probe MUST treat
     ///         that revert as "version 1" instead of propagating it. This is the V1 case.
     function test_versionProbeRevertsOnContractWithoutGetter() public {
-        (bool ok,) = address(phUSD).staticcall(VERSION_CALLDATA);
+        (bool ok,) = address(antimatter).staticcall(VERSION_CALLDATA);
         assertFalse(ok, "a staker without STAKER_VERSION must revert, not return a value");
-        assertEq(_probeVersion(address(phUSD)), 1, "a reverting probe means version 1");
+        assertEq(_probeVersion(address(antimatter)), 1, "a reverting probe means version 1");
     }
 
     /// @notice The probe returns the real version when the getter is present.

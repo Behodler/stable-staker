@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
 import "../src/InPlaceMigrator.sol";
 import "../src/interfaces/IStableStaker.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
@@ -16,7 +16,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 ///         then re-inject the same users into the SAME staker (migrateIn). A permissionless
 ///         self-only timeout escape hatch (claimTimedOut) returns principal if the operator stalls.
 contract InPlaceMigratorTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
     InPlaceMigrator internal migrator;
     MockERC20 internal usdc;
@@ -29,13 +29,13 @@ contract InPlaceMigratorTest is Test {
     uint256 internal constant TIMEOUT = 7 days;
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(staker), true);
+        antimatter = new Antimatter(owner);
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         staker.addToken(address(usdc));
-        staker.phUSDPerDay(address(usdc), PER_DAY);
+        staker.antimatterPerDay(address(usdc), PER_DAY);
 
         migrator = new InPlaceMigrator(IStableStaker(address(staker)), TIMEOUT, owner);
         staker.setMigrator(address(migrator));
@@ -99,7 +99,7 @@ contract InPlaceMigratorTest is Test {
 
     function test_fullInPlaceCycle_rewireThroughV2() public {
         _stakeAliceAndBob();
-        // Accrue rewards so migrateOut mints non-zero phUSD.
+        // Accrue rewards so migrateOut mints non-zero antimatter.
         vm.warp(block.timestamp + 1 days);
         uint256 pendingAlice = staker.pendingReward(address(usdc), alice);
         uint256 pendingBob = staker.pendingReward(address(usdc), bob);
@@ -109,9 +109,9 @@ contract InPlaceMigratorTest is Test {
         migrator.initiateMigration(address(usdc));
         migrator.migrateOut(address(usdc), _users());
 
-        // Earned phUSD already minted to users at migrateOut (story 022: pending + backlog).
-        assertEq(phUSD.balanceOf(alice), pendingAlice);
-        assertEq(phUSD.balanceOf(bob), pendingBob);
+        // Earned antimatter already minted to users at migrateOut (story 022: pending + backlog).
+        assertEq(antimatter.balanceOf(alice), pendingAlice);
+        assertEq(antimatter.balanceOf(bob), pendingBob);
         assertEq(staker.unclaimedReward(address(usdc), alice), 0);
         assertEq(staker.unclaimedReward(address(usdc), bob), 0);
 
@@ -348,10 +348,10 @@ contract InPlaceMigratorTest is Test {
     function test_claimTimedOut_reentrancyGuarded() public {
         // Use a reentrant token that re-enters claimTimedOut on transfer.
         ReentrantToken evil = new ReentrantToken();
-        StableStakerV2 evilStaker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(evilStaker), true);
+        StableStakerV2 evilStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(evilStaker), true);
         evilStaker.addToken(address(evil));
-        evilStaker.phUSDPerDay(address(evil), PER_DAY);
+        evilStaker.antimatterPerDay(address(evil), PER_DAY);
 
         InPlaceMigrator evilMig = new InPlaceMigrator(IStableStaker(address(evilStaker)), TIMEOUT, owner);
         evilStaker.setMigrator(address(evilMig));

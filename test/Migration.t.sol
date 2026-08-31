@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
 import "../src/CrossVersionMigrator.sol";
 import "../src/interfaces/IStableStaker.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
@@ -15,7 +15,7 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 ///         and moves users to the new staker. Payouts are a fixed pro-rata of the snapshot, so they are
 ///         identical across batch composition, ordering, and batch-vs-self exit.
 contract MigrationTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal oldStaker;
     StableStakerV2 internal newStaker;
     CrossVersionMigrator internal migrator;
@@ -31,19 +31,19 @@ contract MigrationTest is Test {
     event PrincipalDivergence(address indexed token, uint256 claimed, uint256 booked, uint256 relinquished);
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        oldStaker = new StableStakerV2(phUSD, owner);
-        newStaker = new StableStakerV2(phUSD, owner);
+        antimatter = new Antimatter(owner);
+        oldStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        newStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
 
-        // both instances may mint phUSD
-        phUSD.setMinter(address(oldStaker), true);
-        phUSD.setMinter(address(newStaker), true);
+        // both instances may mint antimatter
+        antimatter.setApprovedMinter(address(oldStaker), true);
+        antimatter.setApprovedMinter(address(newStaker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         oldStaker.addToken(address(usdc));
         newStaker.addToken(address(usdc));
-        oldStaker.phUSDPerDay(address(usdc), PER_DAY);
-        newStaker.phUSDPerDay(address(usdc), PER_DAY);
+        oldStaker.antimatterPerDay(address(usdc), PER_DAY);
+        newStaker.antimatterPerDay(address(usdc), PER_DAY);
 
         migrator = new CrossVersionMigrator(
             IStableStakerMigratable(address(oldStaker)), IStableStakerMigratable(address(newStaker)), owner
@@ -126,8 +126,8 @@ contract MigrationTest is Test {
         // --- earned rewards minted to the users during batchMigrate (same block => exact) ---
         // Story 022: the exit pays pending + any `unclaimedReward` backlog. Neither user booked one
         // here, so the figures are unchanged, and the backlog is zero on the way out either way.
-        assertEq(phUSD.balanceOf(alice), pendingAlice);
-        assertEq(phUSD.balanceOf(bob), pendingBob);
+        assertEq(antimatter.balanceOf(alice), pendingAlice);
+        assertEq(antimatter.balanceOf(bob), pendingBob);
         assertEq(oldStaker.unclaimedReward(address(usdc), alice), 0);
         assertEq(oldStaker.unclaimedReward(address(usdc), bob), 0);
 
@@ -145,12 +145,12 @@ contract MigrationTest is Test {
         assertEq(usdc.balanceOf(address(migrator)), 0);
 
         // --- v2 keeps accruing; alice (who never signed anything) can claim ---
-        uint256 aliceBefore = phUSD.balanceOf(alice);
+        uint256 aliceBefore = antimatter.balanceOf(alice);
         vm.warp(block.timestamp + 100);
         assertApproxEqAbs(newStaker.pendingReward(address(usdc), alice), 25 ether, 1e6); // 1:3 share of 100e18
         vm.prank(alice);
         newStaker.claim(address(usdc));
-        assertGt(phUSD.balanceOf(alice), aliceBefore);
+        assertGt(antimatter.balanceOf(alice), aliceBefore);
     }
 
     // ============================== PERMISSION GUARDS ==============================
@@ -250,14 +250,14 @@ contract MigrationTest is Test {
         returns (uint256 alicePayout, uint256 bobPayout)
     {
         // Fresh isolated deployment so permutations don't interfere.
-        StableStakerV2 oStaker = new StableStakerV2(phUSD, owner);
-        StableStakerV2 nStaker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(oStaker), true);
-        phUSD.setMinter(address(nStaker), true);
+        StableStakerV2 oStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        StableStakerV2 nStaker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(oStaker), true);
+        antimatter.setApprovedMinter(address(nStaker), true);
         oStaker.addToken(address(usdc));
         nStaker.addToken(address(usdc));
-        oStaker.phUSDPerDay(address(usdc), PER_DAY);
-        nStaker.phUSDPerDay(address(usdc), PER_DAY);
+        oStaker.antimatterPerDay(address(usdc), PER_DAY);
+        nStaker.antimatterPerDay(address(usdc), PER_DAY);
         CrossVersionMigrator m = new CrossVersionMigrator(
             IStableStakerMigratable(address(oStaker)), IStableStakerMigratable(address(nStaker)), owner
         );
@@ -497,7 +497,7 @@ contract MigrationTest is Test {
 
     // ============================== REWARDS STILL MINTED ==============================
 
-    // Each migrating user's frozen pending phUSD is minted regardless of the principal haircut, and
+    // Each migrating user's frozen pending antimatter is minted regardless of the principal haircut, and
     // emissions are frozen at the snapshot (_updatePool no-op while active).
     function test_rewards_frozenAtSnapshotAndMinted() public {
         MockYieldStrategy strategy = _routeOldThroughStrategy();
@@ -518,8 +518,8 @@ contract MigrationTest is Test {
         migrator.migrate(address(usdc), _users());
 
         // Pending minted in full (frozen value), independent of the 10% principal haircut.
-        assertEq(phUSD.balanceOf(alice), pendingAlice);
-        assertEq(phUSD.balanceOf(bob), pendingBob);
+        assertEq(antimatter.balanceOf(alice), pendingAlice);
+        assertEq(antimatter.balanceOf(bob), pendingBob);
         assertEq(oldStaker.unclaimedReward(address(usdc), alice), 0);
         assertEq(oldStaker.unclaimedReward(address(usdc), bob), 0);
     }
@@ -666,7 +666,7 @@ contract MigrationTest is Test {
         vm.prank(alice);
         oldStaker.userMigrate(address(usdc));
         assertEq(usdc.balanceOf(alice) - aliceBalBefore, 90e6); // 0.9 * 100e6
-        assertEq(phUSD.balanceOf(alice), pendingAlice); // frozen pending minted (no backlog booked)
+        assertEq(antimatter.balanceOf(alice), pendingAlice); // frozen pending minted (no backlog booked)
         assertEq(oldStaker.unclaimedReward(address(usdc), alice), 0);
 
         address[] memory justBob = new address[](1);

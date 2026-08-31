@@ -3,14 +3,14 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/StableStakerV2.sol";
-import "flax-token/FlaxToken.sol";
+import {Antimatter} from "antimatter/Antimatter.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockYieldStrategy} from "./mocks/MockYieldStrategy.sol";
 
 /// @notice Core unit tests for StableStaker: staking math, enumerable set, pausing, escape hatch.
 contract StableStakerTest is Test {
-    FlaxToken internal phUSD;
+    Antimatter internal antimatter;
     StableStakerV2 internal staker;
     MockERC20 internal usdc; // 6 decimals
     MockERC20 internal dai; // 18 decimals
@@ -21,19 +21,19 @@ contract StableStakerTest is Test {
     address internal bob = address(0xB0B);
     address internal carol = address(0xCA801);
 
-    uint256 internal constant PER_DAY = 86_400 ether; // -> 1e18 phUSD per second
+    uint256 internal constant PER_DAY = 86_400 ether; // -> 1e18 antimatter per second
 
     function setUp() public {
-        phUSD = new FlaxToken();
-        staker = new StableStakerV2(phUSD, owner);
-        phUSD.setMinter(address(staker), true);
+        antimatter = new Antimatter(owner);
+        staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
+        antimatter.setApprovedMinter(address(staker), true);
 
         usdc = new MockERC20("USD Coin", "USDC", 6);
         dai = new MockERC20("Dai", "DAI", 18);
 
         staker.addToken(address(usdc));
         staker.addToken(address(dai));
-        staker.phUSDPerDay(address(usdc), PER_DAY);
+        staker.antimatterPerDay(address(usdc), PER_DAY);
         staker.setPauser(pauser);
 
         _fund(alice);
@@ -81,7 +81,7 @@ contract StableStakerTest is Test {
         vm.warp(block.timestamp + 100);
         vm.prank(alice);
         staker.claim(address(usdc));
-        assertEq(phUSD.balanceOf(alice), 100 ether);
+        assertEq(antimatter.balanceOf(alice), 100 ether);
         assertEq(staker.pendingReward(address(usdc), alice), 0);
     }
 
@@ -94,7 +94,7 @@ contract StableStakerTest is Test {
         assertEq(usdc.balanceOf(alice), balBefore + 40e6);
         // Story 022: withdraw settles the reward but no longer mints it — it is booked to
         // `unclaimedReward` and paid by `claim`.
-        assertEq(phUSD.balanceOf(alice), 0);
+        assertEq(antimatter.balanceOf(alice), 0);
         assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         assertEq(staker.claimableReward(address(usdc), alice), 100 ether);
         (uint256 amount,) = staker.userInfo(address(usdc), alice);
@@ -103,7 +103,7 @@ contract StableStakerTest is Test {
         // The reward is still fully payable, on the explicit claim.
         vm.prank(alice);
         staker.claim(address(usdc));
-        assertEq(phUSD.balanceOf(alice), 100 ether);
+        assertEq(antimatter.balanceOf(alice), 100 ether);
     }
 
     function test_fullWithdraw_removesFromSet() public {
@@ -123,7 +123,7 @@ contract StableStakerTest is Test {
     }
 
     function test_multiToken_independent() public {
-        staker.phUSDPerDay(address(dai), PER_DAY * 2); // 2e18/s
+        staker.antimatterPerDay(address(dai), PER_DAY * 2); // 2e18/s
         _stake(alice, address(usdc), 100e6);
         _stake(alice, address(dai), 100 ether);
         vm.warp(block.timestamp + 100);
@@ -176,10 +176,10 @@ contract StableStakerTest is Test {
         staker.addToken(address(0x1234));
     }
 
-    function test_phUSDPerDay_onlyOwner() public {
+    function test_antimatterPerDay_onlyOwner() public {
         vm.prank(alice);
         vm.expectRevert();
-        staker.phUSDPerDay(address(usdc), PER_DAY);
+        staker.antimatterPerDay(address(usdc), PER_DAY);
     }
 
     function test_stake_unknownToken_reverts() public {
@@ -237,7 +237,7 @@ contract StableStakerTest is Test {
         vm.prank(alice);
         staker.emergencyWithdraw(address(usdc));
         assertEq(usdc.balanceOf(alice), balBefore + 100e6);
-        assertEq(phUSD.balanceOf(alice), 0); // reward forfeited
+        assertEq(antimatter.balanceOf(alice), 0); // reward forfeited
         // Story 022: the backlog is forfeited too, so nothing is left to claim afterwards.
         assertEq(staker.unclaimedReward(address(usdc), alice), 0);
         assertEq(staker.claimableReward(address(usdc), alice), 0);

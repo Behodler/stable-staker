@@ -3,3 +3,7 @@ forge-std/=lib/forge-std/src/
 flax-token/=lib/flax-token/src/
 pauser/=lib/pauser/src/
 reflax-yield-vault/=lib/reflax-yield-vault/src/
+antimatter/=lib/antimatter/src/
+@phUSD/=lib/antimatter/lib/flax-token-v2/src/
+@phUSDMinter/=lib/antimatter/lib/phUSD-stable-minter/src/
+@pauser/=lib/antimatter/lib/pauser/src/

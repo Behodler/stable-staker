@@ -5,12 +5,27 @@ Guidance for Claude Code when working in the `stable-staker` submodule.
 ## Overview
 
 `stable-staker` is a MasterChef-style yield farm that supports any number of staked (stable)
-tokens and rewards stakers in **phUSD** (the `FlaxToken` from the `flax-token` dependency).
-Rewards are not pre-funded: this contract is an authorized phUSD **minter** and mints rewards
-directly to users on **claim and terminal migration only**. `stake` and `withdraw` no longer touch
-phUSD at all — they *book* the settled amount to the `unclaimedReward` mapping, which `claim` pays
-out (story 022). That is deliberate robustness: a revoked minter role, or any phUSD revert, can no
-longer brick a principal path. Consequences worth knowing:
+tokens and rewards stakers in **Antimatter** (the `Antimatter` token from the `antimatter`
+submodule). Rewards are not pre-funded: this contract is an approved Antimatter **minter** and
+mints rewards directly to users on **claim and terminal migration only**. `stake` and `withdraw`
+no longer touch Antimatter at all — they *book* the settled amount to the `unclaimedReward`
+mapping, which `claim` pays out (story 022). That is deliberate robustness: a revoked minter role,
+or any Antimatter revert, can no longer brick a principal path.
+
+**Emissions token, by version (story 023).** The evergreen `src/StableStakerV2.sol` emits
+**Antimatter**. The byte-frozen `src/versions/v1/StableStakerV1.sol` emits **phUSD** and always
+will — the live mainnet V1 instance is deployed and unpatchable, so that is correct and permanent,
+not an oversight. V2 holds only a minimal local `src/interfaces/IAntimatter.sol`
+(`mint(address,uint256)` and nothing else); the concrete `Antimatter` is deployed in tests from
+`lib/antimatter`. Authorization is Antimatter's owner-managed whitelist,
+`setApprovedMinter(address,bool)`, and an unapproved caller reverts with the custom error
+`NotApprovedMinter(address)` — there is no phUSD-style `mintVersion` mass revocation, so
+per-minter `setApprovedMinter(x, false)` is the only way to revoke.
+
+**Naming.** flax-token-v2 is called **phUSD**, never "flax" — mirroring `antimatter/CLAUDE.md`.
+`pxUSD` is an unrelated third-party token and never belongs in this repo.
+
+Consequences worth knowing:
 
 - `emergencyWithdraw` forfeits the `unclaimedReward` backlog as well as the live pending — the
   escape hatch stays the single rule "no reward, principal out", and never mints.
@@ -23,7 +38,7 @@ longer brick a principal path. Consequences worth knowing:
 - See `docs/deferred-reward-accrual-plan.md`.
 
 - `src/StableStakerV2.sol` — the farm, and the **evergreen** contract: all forward work happens
-  here. Per-token pools, owner-set `phUSDPerDay(token, amount)`
+  here. Per-token pools, owner-set `antimatterPerDay(token, amount)`
   emission budget, per-token `EnumerableSet` of stakers (`getStakers` / `getStakersRange` /
   `stakerCount`), Behodler3 pausing (`pauser` + `IPausable`), and a permissionless
   `emergencyWithdraw` escape hatch.
@@ -53,29 +68,31 @@ longer brick a principal path. Consequences worth knowing:
 
 ## Core safety invariant
 
-No sequence of user actions can **accrue** more than `phUSDPerDay` for a token over any window,
-and cumulative *minted* is always `<=` cumulative *accrued*. The only writer of `accPhusdPerShare`
-is `_updatePool`, which folds in exactly `elapsed * phusdPerSecond` per update; the sum of all
+No sequence of user actions can **accrue** more than `antimatterPerDay` for a token over any
+window, and cumulative *minted* is always `<=` cumulative *accrued*. The only writer of
+`accAntimatterPerShare` is `_updatePool`, which folds in exactly `elapsed * antimatterPerSecond`
+per update; the sum of all
 stakers' pending increase equals that minus integer-division dust (which always rounds DOWN).
-Empty-pool windows accrue nothing; flash staking earns nothing; `phUSDPerDay` settles the pool at
+Empty-pool windows accrue nothing; flash staking earns nothing; `antimatterPerDay` settles the pool at
 the old rate before changing it.
 
 Since story 022, reward is *booked* to `unclaimedReward` rather than transferred on
 `stake`/`withdraw`, so minted alone understates what was accrued. The statement carrying the
 invariant is `sum(unclaimedReward) + minted <= cap`. Payout timing is strictly downstream of
-accrual — no new path writes `accPhusdPerShare` — so the cap holds a fortiori. Read the claimable
+accrual — no new path writes `accAntimatterPerShare` — so the cap holds a fortiori. Read the claimable
 total via `claimableReward`; `pendingReward` remains projection-only and excludes the backlog. See
 `test/EmissionCap.t.sol` and `test/DeferredAccrual.t.sol`.
 
 ## Wiring (deployment)
 
-1. Deploy `StableStakerV2(phUSD, owner)`.
-2. phUSD owner calls `phUSD.setMinter(address(staker), true)`.
-3. `staker.addToken(token)` for each stable, then `staker.phUSDPerDay(token, amountPerDay)`.
+1. Deploy `StableStakerV2(antimatter, owner)`.
+2. Antimatter owner calls `antimatter.setApprovedMinter(address(staker), true)`.
+3. `staker.addToken(token)` for each stable, then `staker.antimatterPerDay(token, amountPerDay)`.
 4. Optional: `staker.setPauser(pauser)`, `staker.setMigrator(migrator)`.
 
 For migration, both old and new stakers must have the migrator set (`setMigrator`) and the new
-staker must have the token registered (`addToken`); the new staker must also be a phUSD minter.
+staker must have the token registered (`addToken`); the new staker must also be an approved minter
+on its own reward token (Antimatter for V2 and onward, phUSD for the frozen V1).
 
 ## Yield strategies (per-token principal custody)
 
@@ -105,8 +122,8 @@ forward the **actual received** amount (balance delta), while internal principal
 decremented by the **requested** amount — sub-amount differences remain protocol-owned yield/loss
 (consistent with `ERC4626YieldStrategy`'s rounding rule).
 
-**Yield stays protocol-owned.** Stakers only ever get their *principal* back plus phUSD emissions.
-Reward accounting (`accPhusdPerShare`, `rewardDebt`, `totalStaked`, `_updatePool`, `_settle`) is
+**Yield stays protocol-owned.** Stakers only ever get their *principal* back plus Antimatter
+emissions. Reward accounting (`accAntimatterPerShare`, `rewardDebt`, `totalStaked`, `_updatePool`, `_settle`) is
 untouched by this routing; the farm never reads `totalBalanceOf` to credit a user. Accrued yield
 accumulates inside the strategy as protocol-owned surplus (skimmed elsewhere via the strategy's
 `skimSurplus`).
@@ -345,7 +362,16 @@ Plain git submodules under `lib/` (no "mutable dependency" mechanism):
 
 - `lib/openzeppelin-contracts` — external, pinned to tag `v5.6.1`.
 - `lib/forge-std` — external, pinned to tag `v1.16.1`.
-- `lib/flax-token` — phoenix project, tracks `master` HEAD.
+- `lib/flax-token` — phoenix project, tracks `master` HEAD. phUSD; still the emissions token of
+  the frozen V1 snapshot.
+- `lib/antimatter` — phoenix project, pinned at `a5570ce`. Provides the `Antimatter` emissions
+  token that `StableStakerV2` mints (story 023). Remapped as `antimatter/=lib/antimatter/src/`,
+  with the transitive `@phUSD/`, `@phUSDMinter/` and `@pauser/` remappings its sources need.
+  Requires `git submodule update --init --recursive`: antimatter's own `lib/pauser` and its
+  `lib/phUSD-stable-minter/lib/pauser` are not initialized by a shallow init. Test files import it
+  as `import {Antimatter} from "antimatter/Antimatter.sol";` — the named form is required, because
+  a plain import drags a second `IPausable` declaration into scope and collides with this repo's
+  own `pauser/interfaces/IPausable.sol`.
 - `lib/pauser` — phoenix project, tracks `master` HEAD.
 - `lib/reflax-yield-vault` — phoenix project, tracks `master` HEAD. Provides
   `IYieldStrategy` / `AYieldStrategy` / `ERC4626YieldStrategy` (see "Yield strategies" above).
