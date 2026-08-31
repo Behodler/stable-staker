@@ -130,13 +130,30 @@ Mechanics worth knowing before touching this code:
     so it over-quotes on a fee-charging vault. The real balance delta across the exit is
     therefore **measured**, and a delivery below the pro-rated guarantee reverts
     `"StableStaker: exit shortfall"`. A lying preview must fail the transaction.
-  - **The idle buffer is never the payer.** Charging the net and letting the shortfall fall on
-    the contract's idle balance socialises one caller's routine exit loss across every staker,
+  - **The floor carries a ROUNDING allowance, and only a rounding allowance**
+    (`EXIT_ROUNDING_ALLOWANCE` = 2 raw units, plus `EXIT_ROUNDING_ALLOWANCE_BPS` = 1 bp). Without
+    it the check is an exact equality — `AYieldStrategy.previewExitFor`'s default is the capped
+    *identity*, so `netGuaranteed == grossToRequest` — while `ERC4626YieldStrategy._disposeShares`
+    redeems `vault.convertToShares(amount)` and the vault floors the assets back, rounding down
+    twice and delivering `amount - 1` or less at any non-integral share price. That combination
+    made `autoAnnihilate` revert on essentially every call against a plain ERC4626 vault that had
+    accrued yield, which with `claimEnabled` false is the only reward path there is. One basis
+    point is far below any real haircut, so a genuinely short delivery — or a preview lying to
+    widen the raw-mint path around the closed `claim` — still reverts.
+  - **The idle buffer is never the payer** *on a solvent strategy*. Charging the net and letting
+    the shortfall fall on the contract's idle balance socialises one caller's routine exit loss across every staker,
     because that balance is the shared underwater-withdrawal buffer. Symmetrically, anything the
     exit over-delivers is forwarded to the caller rather than left to grow the buffer at their
     expense. The user absorbing their own haircut is the same outcome as withdrawing manually and
     annihilating in their own wallet, and every other principal-moving path (`withdraw`,
     `emergencyWithdraw`) already works this way.
+
+    The carve-out is the **underwater** path, which `autoAnnihilate` shares with `withdraw` and
+    does not change: when `_isUnderwater` is true, `_routeExit` pays the whole request out of the
+    idle balance plus `relinquishPrincipal` and returns the nominal amount without measuring
+    anything. That is the buffer doing exactly the job it exists for, and it is deliberate — see
+    "idle balance is automatically buffer" above — but it means "the buffer is untouched" is a
+    statement about the normal path, not an invariant of every call.
 
   A strategy that can guarantee nothing at all — the market strategy at a 100% slippage
   tolerance, which answers `(0, 0)` to every preview — makes `autoAnnihilateAvailable(token)`
