@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 
 /**
@@ -43,6 +44,18 @@ contract MockYieldStrategy is IYieldStrategy {
     /// @notice Deposit slippage in basis points. 0 = full credit (default, preserves old behaviour).
     uint256 public depositSlippageBps;
 
+    /// @notice EXIT slippage in basis points, modelling {ERC4626MarketYieldStrategy}'s AMM sale on
+    ///         withdraw: principal is debited by the full REQUESTED (gross) amount, but only
+    ///         `gross * (10000 - exitSlippageBps) / 10000` is delivered. 0 = full credit (default,
+    ///         so every pre-existing test keeps its old behaviour byte for byte).
+    uint256 public exitSlippageBps;
+
+    /// @notice Makes {previewExitFor} OVER-QUOTE `netGuaranteed` by this many basis points relative
+    ///         to what {withdraw} will actually deliver, without changing delivery. Models a
+    ///         manipulated or fee-blind preview (vault-RM 049: `convertToAssets` is the fee-free
+    ///         ideal conversion). 0 = honest preview.
+    uint256 public previewOverQuoteBps;
+
     constructor() {
         owner = msg.sender;
     }
@@ -67,6 +80,19 @@ contract MockYieldStrategy is IYieldStrategy {
     /// @notice Set the deposit slippage (basis points). 0 = full credit; >0 books less than `amount`.
     function setDepositSlippageBps(uint256 bps) external {
         depositSlippageBps = bps;
+    }
+
+    /// @notice Set the EXIT slippage (basis points). 0 = full credit; >0 delivers less than the
+    ///         gross requested while still debiting the full gross from principal.
+    function setExitSlippageBps(uint256 bps) external {
+        require(bps <= 10_000, "MockYieldStrategy: bps>MAX");
+        exitSlippageBps = bps;
+    }
+
+    /// @notice Make {previewExitFor} lie upward about `netGuaranteed` by `bps`, leaving delivery
+    ///         untouched — the manipulated/over-quoting preview a consumer must defend against.
+    function setPreviewOverQuoteBps(uint256 bps) external {
+        previewOverQuoteBps = bps;
     }
 
     // ============ IYieldStrategy CORE ============
@@ -102,6 +128,10 @@ contract MockYieldStrategy is IYieldStrategy {
         uint256 valued = (amount * valueFactorBps) / 10_000;
         uint256 payout = valued < amount ? valued : amount;
 
+        // Market-style exit haircut: the gross request is sold and only the net arrives. Applied
+        // AFTER the par cap so the two knobs compose (an underwater strategy that also sells).
+        payout = (payout * (10_000 - exitSlippageBps)) / 10_000;
+
         // Decrement principal by the REQUESTED amount (any difference is protocol-owned yield/loss).
         principal[token][recipient] -= amount;
         totalPrincipal[token] -= amount;
@@ -123,6 +153,31 @@ contract MockYieldStrategy is IYieldStrategy {
 
     function balanceOf(address token, address account) external view override returns (uint256) {
         return principal[token][account];
+    }
+
+    /// @notice vault-RM story 050 exit preview: the gross a caller must request to net `netWanted`,
+    ///         and the net that gross is guaranteed to deliver.
+    /// @dev Mirrors {withdraw}: gross-up by `exitSlippageBps`, cap at the account's principal exactly
+    ///      as `withdraw` caps it, then report the delivery for the CAPPED gross. `(0, 0)` at a 100%
+    ///      exit slippage, matching `ERC4626MarketYieldStrategy`'s division-by-zero guard.
+    ///      `previewOverQuoteBps` inflates ONLY the guarantee, never the delivery.
+    function previewExitFor(address token, address account, uint256 netWanted)
+        external
+        view
+        override
+        returns (uint256 grossToRequest, uint256 netGuaranteed)
+    {
+        uint256 denominator = 10_000 - exitSlippageBps;
+        if (denominator == 0) {
+            return (0, 0);
+        }
+        grossToRequest = Math.ceilDiv(netWanted * 10_000, denominator);
+        uint256 available = principal[token][account];
+        if (grossToRequest > available) {
+            grossToRequest = available;
+        }
+        netGuaranteed = (grossToRequest * denominator) / 10_000;
+        netGuaranteed = (netGuaranteed * (10_000 + previewOverQuoteBps)) / 10_000;
     }
 
     // ============ IYieldStrategy UNUSED-BY-STAKER STUBS ============
