@@ -23,7 +23,9 @@ contract MockERC4626Vault is ERC4626 {
     }
 }
 
-/// @dev Minimal transferFrom helper so the mock does not drag in SafeERC20's full surface.
+/// @dev Minimal transferFrom helper used only by `accrue`. This saves nothing in bytecode terms —
+///      OpenZeppelin's ERC4626, inherited above, already imports SafeERC20 — it just keeps the
+///      donation path's return-data handling visible in this file.
 library SafeERC20Lite {
     function transferFrom(address token, address from, address to, uint256 amount) internal {
         (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
