@@ -338,6 +338,7 @@ contract DeferredAccrualTest is Test {
         assertEq(staker.unclaimedReward(address(usdc), alice), 100 ether);
         assertEq(staker.claimableReward(address(usdc), alice), 100 ether, "claimable carries the backlog");
     }
+
     // ============================== CLAIM GATE (story 025) ==============================
 
     /// @notice `claimEnabled` is a UX gate, not an access control: it is off on a freshly deployed

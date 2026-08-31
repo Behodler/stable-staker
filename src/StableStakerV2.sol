@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "./interfaces/IAntimatter.sol";
@@ -64,6 +65,16 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
     /// @notice Address authorized to perform permissioned migration (initiateMigration / batchMigrate / depositFor).
     address public migrator;
+
+    /// @notice Whether {claim} is open. FALSE ON DEPLOYMENT: while the flag is down, {autoAnnihilate}
+    ///         is the reward path, so a staker's first encounter with antimatter is an annihilation
+    ///         rather than a balance they do not understand.
+    /// @dev A UX gate, NOT an access control. It is expected to be flipped true within weeks, it is
+    ///      the documented operational answer to an antimatter-side pause, and {autoAnnihilate} mints
+    ///      any reward that outruns the caller's principal directly to them anyway. Nothing in this
+    ///      contract's safety argument may depend on antimatter being unobtainable while it is false.
+    ///      The terminal-migration mint in {_exitPosition} is deliberately NOT gated by it.
+    bool public claimEnabled;
 
     /// @notice Per-token reward pool accounting.
     struct PoolInfo {
@@ -152,6 +163,20 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     event BufferWithdrawn(address indexed token, address indexed user, uint256 amount);
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
     event PoolReset(address indexed token);
+    event ClaimEnabledSet(bool enabled);
+
+    /// @notice Emitted by {autoAnnihilate}. `antimatterBurned` is the 18-decimal amount annihilated,
+    ///         `principalConsumed` is the caller's own booked principal it was annihilated against
+    ///         (in `token` decimals), and `excessMinted` is the reward that outran that principal and
+    ///         was minted straight to the caller. Sub-unit dust appears in neither: it stays booked in
+    ///         {unclaimedReward}.
+    event AutoAnnihilated(
+        address indexed token,
+        address indexed user,
+        uint256 antimatterBurned,
+        uint256 principalConsumed,
+        uint256 excessMinted
+    );
 
     /// @notice Emitted once by EVERY initiateMigration, including a clean one. `claimed` is the pool's
     ///         totalStaked snapshot P; `booked` is strategy.principalOf after the full exit;
@@ -222,6 +247,13 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     function setMigrator(address _migrator) external onlyOwner {
         migrator = _migrator;
         emit MigratorSet(_migrator);
+    }
+
+    /// @notice Open or close {claim}. Closed on deployment; see {claimEnabled}.
+    /// @dev One transaction, no redeploy — which is the whole reason the teaching phase is a flag.
+    function setClaimEnabled(bool enabled) external onlyOwner {
+        claimEnabled = enabled;
+        emit ClaimEnabledSet(enabled);
     }
 
     /// @notice Set (or clear, with address(0)) the pauser address.
@@ -369,11 +401,18 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     }
 
     /// @notice Mint the caller's Antimatter reward for `token` without touching principal: the
-    ///         settled-but-unminted {unclaimedReward} backlog plus anything freshly pending. This is
-    ///         the only user-facing path that mints, and {claimableReward} reads the figure it pays.
-    /// @dev Succeeds for a caller with no position but a non-zero backlog (someone who fully withdrew
+    ///         settled-but-unminted {unclaimedReward} backlog plus anything freshly pending.
+    ///         {claimableReward} reads the figure it pays.
+    /// @dev CLOSED BY DEFAULT since story 025 — see {claimEnabled}. It is no longer the only
+    ///      user-facing path that mints: {autoAnnihilate} mints too (to this contract, and to the
+    ///      caller for any excess over their principal), and it is the path users are steered to while
+    ///      this one is shut.
+    ///
+    ///      Succeeds for a caller with no position but a non-zero backlog (someone who fully withdrew
     ///      and has not claimed yet). Still `whenNotPaused`, so a pause withholds the backlog too.
+    ///      Deliberately has no `PoolState.Active` gate: it moves no principal.
     function claim(address token) external nonReentrant whenNotPaused poolExists(token) {
+        require(claimEnabled, "StableStaker: claim disabled");
         PoolInfo storage pool = poolInfo[token];
         _updatePool(token);
         UserInfo storage user = userInfo[token][msg.sender];
@@ -384,6 +423,108 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         user.rewardDebt = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION;
         antimatter.mint(msg.sender, owed);
         emit Claimed(token, msg.sender, owed);
+    }
+
+    /**
+     * @notice Annihilate the caller's owed Antimatter for `token` against their OWN booked principal
+     *         and receive phUSD. The staked position shrinks by exactly the stable half consumed.
+     * @dev The reward path while {claimEnabled} is false, and the point of the teaching phase:
+     *      annihilation becomes something the staker has done rather than something they have read
+     *      about. Reward arithmetic is byte-identical to {claim} (settle, read
+     *      `unclaimedReward + pending`, drain the mapping, re-base `rewardDebt`), so the emission-cap
+     *      invariant in the contract header is untouched.
+     *
+     *      Sequence, and every step is load-bearing:
+     *        1. `owed` is 18-decimal antimatter; principal is in `token` decimals. Principal is scaled
+     *           up by `10 ** (18 - decimals)` to compare the two.
+     *        2. The annihilated amount is capped at the caller's own principal and then FLOORED to a
+     *           multiple of that scale, because {IAntimatter-toStableAmount} reverts rather than round.
+     *        3. The sub-unit remainder is left in {unclaimedReward} — not minted, not transferred. It
+     *           accrues to the next call, so it is neither stranded nor a dust-sized bypass of a
+     *           disabled {claim}, and it rounds in the protocol's favour.
+     *        4. Reward that OUTRUNS the caller's principal cannot be annihilated (there is no
+     *           principal left to annihilate it against) and is minted straight to them, exactly as a
+     *           claim would. A knowing, documented loophole around the gate — see CLAUDE.md. The
+     *           alternative, reverting, strands a user whose rewards outgrew their stake.
+     *        5. The stable half is sourced through {_routeExit}, never from the raw idle balance: with
+     *           a strategy set the stable lives in the strategy, and the buffer path's
+     *           `relinquishPrincipal` is what keeps `strategy.principalOf` in lockstep with
+     *           `totalStaked`.
+     *        6. Antimatter burns the CALLER's own balance, so the reward is minted to `address(this)`,
+     *           the stable half is approved to Antimatter, and `recipient` is the user: the phUSD
+     *           lands in their wallet with no second transfer. The approval is reset to zero after.
+     *
+     *      Gated on `PoolState.Active` like {stake} / {withdraw} / {emergencyWithdraw}, because unlike
+     *      {claim} this moves principal and would corrupt the terminal-migration `P` snapshot.
+     *      `annihilate` is `whenNotPaused` against ANTIMATTER's pauser, which this contract does not
+     *      control; the operational answer to that pause is {setClaimEnabled}(true).
+     * @param token The pool token, which must ALSO be a registered stablecoin on the phUSD stable
+     *              minter — see {autoAnnihilateAvailable}.
+     * @param minPhUSDOut The least phUSD the caller accepts across both halves, forwarded verbatim to
+     *              Antimatter. The stable minter's exchange rate is configurable and not guaranteed
+     *              1:1, so this is real slippage protection; passing zero waives it.
+     */
+    function autoAnnihilate(address token, uint256 minPhUSDOut) external nonReentrant whenNotPaused poolExists(token) {
+        require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
+        // Explicit and ahead of any state change, so the UI never has to interpret a foreign
+        // contract's `StablecoinNotRegistered` custom error to tell "this token cannot be
+        // annihilated" from "you have nothing to annihilate".
+        require(autoAnnihilateAvailable(token), "StableStaker: token not annihilatable");
+
+        // The 18-decimal antimatter scale for one raw unit of `token`.
+        uint256 scale = _antimatterScale(token);
+        uint256 annihilatable;
+        uint256 stableNeeded;
+        uint256 excess;
+
+        // Scoped so the intermediate arithmetic leaves the stack before the interactions below.
+        {
+            PoolInfo storage pool = poolInfo[token];
+            _updatePool(token);
+            UserInfo storage user = userInfo[token][msg.sender];
+
+            // Byte-identical to {claim}: the settled backlog plus anything freshly pending.
+            uint256 owed = unclaimedReward[token][msg.sender]
+                + ((user.amount * pool.accAntimatterPerShare) / ACC_PRECISION - user.rewardDebt);
+            uint256 principalAsAntimatter = user.amount * scale;
+            // Capped at the caller's own principal, then floored to something `token` can express:
+            // toStableAmount reverts on a finer amount rather than rounding it away.
+            uint256 capped = owed < principalAsAntimatter ? owed : principalAsAntimatter;
+            annihilatable = (capped / scale) * scale;
+            excess = owed - capped; // outran the principal; minted straight to the caller
+            require(annihilatable > 0 || excess > 0, "StableStaker: nothing to annihilate");
+            stableNeeded = annihilatable / scale;
+
+            // Effects. All four parts of the bookkeeping, none of them optional: a stale `rewardDebt`
+            // underflows every later settle and bricks the position, and a staker left in the set
+            // makes finalizeAndReset's `stakerCount == 0` unsatisfiable. `capped - annihilatable` is
+            // the sub-unit remainder, carried in the mapping rather than paid out.
+            unclaimedReward[token][msg.sender] = capped - annihilatable;
+            user.amount -= stableNeeded;
+            pool.totalStaked -= stableNeeded;
+            user.rewardDebt = (user.amount * pool.accAntimatterPerShare) / ACC_PRECISION;
+            if (user.amount == 0) {
+                _stakers[token].remove(msg.sender);
+            }
+        }
+
+        // Interactions.
+        if (annihilatable > 0) {
+            // Underwater guard ON, matching {withdraw}: this is a voluntary principal exit, not an
+            // escape hatch, so it must not realize a loss the user did not opt into. The return value
+            // is deliberately unused — a short delivery is covered by the contract's idle buffer if
+            // there is one, and reverts inside `annihilate`'s transferFrom if there is not.
+            _routeExit(token, stableNeeded, true);
+            antimatter.mint(address(this), annihilatable);
+            IERC20(token).forceApprove(address(antimatter), stableNeeded);
+            antimatter.annihilate(token, msg.sender, annihilatable, minPhUSDOut);
+            IERC20(token).forceApprove(address(antimatter), 0);
+        }
+        if (excess > 0) {
+            antimatter.mint(msg.sender, excess);
+        }
+
+        emit AutoAnnihilated(token, msg.sender, annihilatable, stableNeeded, excess);
     }
 
     /**
@@ -616,6 +757,9 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         pool.totalStaked -= amt;
         _stakers[token].remove(account);
 
+        // DELIBERATELY UNGATED by {claimEnabled}. This is the terminal-migration exit, not a claim:
+        // gating it would let a closed claim gate brick migration, and the golden rule is that
+        // migration is never brickable. See {claimEnabled}.
         if (owed > 0) {
             antimatter.mint(account, owed);
         }
@@ -800,6 +944,22 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         return _isUnderwater(token, strategy);
     }
 
+    /**
+     * @notice True when {autoAnnihilate} can work for `token`: the pool token is ALSO a registered
+     *         stablecoin on the phUSD stable minter, with decimals the minter and the token agree on.
+     * @dev A live cross-contract configuration coupling StableStaker has never had before —
+     *      registering a pool token with the stable minter is now part of the pool-registration
+     *      runbook. Probed with a staticcall rather than a try/catch, because Antimatter's
+     *      `toStableAmount` can fail through a return-data decode that a catch block would not
+     *      intercept. `1e18` is representable in every decimals <= 18, so a failure here means the
+     *      configuration, never the amount.
+     */
+    function autoAnnihilateAvailable(address token) public view returns (bool) {
+        (bool ok, bytes memory data) =
+            address(antimatter).staticcall(abi.encodeCall(IAntimatter.toStableAmount, (token, 1e18)));
+        return ok && data.length == 32;
+    }
+
     // ============================== INTERNAL ==============================
 
     /// @dev Accrue rewards for `token` up to the current block. Empty pools accrue nothing.
@@ -844,6 +1004,19 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         uint256 balanceBefore = t.balanceOf(address(this));
         t.safeTransferFrom(from, address(this), amount);
         return t.balanceOf(address(this)) - balanceBefore;
+    }
+
+    /// @dev The 18-decimal-antimatter-per-stable-unit scale for `token`, i.e. `10 ** (18 - decimals)`.
+    ///      Read LIVE from {IERC20Metadata} rather than cached at {addToken}: a cache would have to be
+    ///      backfilled for the already-registered pools of the live V1 and V2 instances, and a token
+    ///      whose decimals move under a cache mis-scales silently, whereas a live read that reverts
+    ///      fails closed. Antimatter cross-checks the same figure against the stable minter's
+    ///      registration and reverts `DecimalsMismatch` if the two disagree, so the live read has an
+    ///      independent auditor on every call.
+    function _antimatterScale(address token) internal view returns (uint256) {
+        uint8 dec = IERC20Metadata(token).decimals();
+        require(dec <= 18, "StableStaker: unsupported decimals");
+        return 10 ** (18 - dec);
     }
 
     /// @dev The strategy is below par for the farm's position when its total balance (principal +
