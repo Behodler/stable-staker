@@ -83,12 +83,84 @@ accrual — no new path writes `accAntimatterPerShare` — so the cap holds a fo
 total via `claimableReward`; `pendingReward` remains projection-only and excludes the backlog. See
 `test/EmissionCap.t.sol` and `test/DeferredAccrual.t.sol`.
 
+## The claim gate and `autoAnnihilate` (story 025)
+
+`claim()` is gated by an owner-settable `claimEnabled` flag and is **false on deployment**.
+While it is down, `autoAnnihilate(address token, uint256 minPhUSDOut)` is the reward path:
+it mints the caller's owed Antimatter to the staker itself, annihilates it against a slice of
+the caller's **own booked principal**, decrements `userInfo.amount` and `poolInfo.totalStaked`
+by the stable half, and Antimatter mints the resulting phUSD straight to the caller. The staker
+watches their principal decline and receives phUSD for it, so annihilation becomes something
+they have done rather than something they have read about.
+
+This is a **teaching phase, not a permanent design**. `setClaimEnabled(true)` reopens `claim`
+in one transaction with no redeploy, which is the entire reason the gate is a flag.
+
+Mechanics worth knowing before touching this code:
+
+- **Decimals.** `owed` is 18-decimal antimatter; principal is in the token's own decimals. The
+  annihilated amount is capped at the caller's principal and then **floored** to a multiple of
+  `10 ** (18 - decimals)`, because `Antimatter.toStableAmount` reverts `AmountNotRepresentable`
+  rather than rounding. The scale is read **live** from `IERC20Metadata(token).decimals()`
+  rather than cached at `addToken`: a cache would need backfilling for pools already registered
+  on the live instances, and it mis-scales silently if a token's decimals move, whereas a live
+  read fails closed. Antimatter cross-checks the same number against the stable minter's
+  registration (`DecimalsMismatch`), so the live read has an independent auditor on every call.
+- **Sub-unit dust** left by that flooring stays in `unclaimedReward` — not minted, not
+  transferred. It accrues to the next call, so it is neither stranded nor a dust-sized bypass of
+  a closed gate, and it rounds in the protocol's favour.
+- **Sourcing the stable half** goes through `_routeExit(token, amount, true)`, never the raw
+  idle balance: with a strategy set the stable lives in the strategy, and the buffer path's
+  `relinquishPrincipal` is what keeps `strategy.principalOf` in lockstep with `totalStaked`
+  (audit findings ss14m1 / ss14l8). The underwater guard is ON, matching `withdraw` — this is a
+  voluntary exit, not an escape hatch.
+- **`PoolState.Active` is required**, unlike `claim`, because this moves principal and would
+  otherwise corrupt the terminal-migration `P` snapshot.
+- **Registered-stable coupling.** `Antimatter.toStableAmount` reverts `StablecoinNotRegistered`
+  unless the pool token is also registered with `PhusdStableMinter`. **Registering a pool token
+  with the stable minter is now part of the pool-registration runbook.** `autoAnnihilate`
+  pre-flights this and reverts `"StableStaker: token not annihilatable"`, and the view
+  `autoAnnihilateAvailable(token)` exposes it, so the UI never has to interpret a foreign
+  contract's custom error.
+- **The migration carve-out.** The Antimatter mint inside `_exitPosition` is deliberately **not**
+  gated by `claimEnabled`. Gating it would let a closed claim gate brick migration.
+- **The two-pause deadlock.** `Antimatter.annihilate` is `whenNotPaused` against *Antimatter's*
+  own Phoenix pauser, which StableStaker does not control. With `claimEnabled == false`, an
+  antimatter-side pause leaves stakers with no reward path at all. The intended response is
+  operational, not a code path: **the owner flips `claimEnabled` to true for the duration of any
+  antimatter pause.** That is an obligation on whoever holds the StableStaker owner key.
+
+### Auditor note — annihilation exceeding principal
+
+When a user's claimable antimatter exceeds their booked principal, the excess cannot be
+annihilated — there is no principal left to annihilate it against. Of the available responses
+(revert, hold the excess indefinitely, force a partial claim), we deliberately choose to **mint
+the excess directly to the user, exactly as a claim would**.
+
+This is a knowing, documented loophole around the disabled `claim()`. We accept it because:
+
+- The alternative — reverting — strands a user whose rewards have outgrown their stake, with no
+  path to their own accrued value. That is a far worse failure than a leak in a temporary
+  teaching gate.
+- The condition requires reward accrual to exceed staked principal, which at realistic emission
+  rates takes a long time relative to how long the gate is intended to stay closed.
+- `claimEnabled` is expected to be flipped on within weeks. The gate is pedagogy, not a security
+  boundary, and should never be relied upon as one.
+
+Auditors should read `claimEnabled` as a UX mechanism with a deliberate escape valve, **not** as
+an access control. Nothing in the protocol's safety argument may depend on antimatter being
+unobtainable while the flag is false.
+
 ## Wiring (deployment)
 
 1. Deploy `StableStakerV2(antimatter, owner)`.
 2. Antimatter owner calls `antimatter.setApprovedMinter(address(staker), true)`.
 3. `staker.addToken(token)` for each stable, then `staker.antimatterPerDay(token, amountPerDay)`.
 4. Optional: `staker.setPauser(pauser)`, `staker.setMigrator(migrator)`.
+5. Register each pool token with `PhusdStableMinter` (`registerStablecoin` + `approveYS`), or
+   `autoAnnihilate` is unavailable for it — check with `staker.autoAnnihilateAvailable(token)`.
+6. `claimEnabled` starts **false** and is meant to stay false for the teaching phase; open it with
+   `staker.setClaimEnabled(true)` when the phase ends, or for the duration of an antimatter pause.
 
 For migration, both old and new stakers must have the migrator set (`setMigrator`) and the new
 staker must have the token registered (`addToken`); the new staker must also be an approved minter
