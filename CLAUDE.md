@@ -114,6 +114,40 @@ Mechanics worth knowing before touching this code:
   `relinquishPrincipal` is what keeps `strategy.principalOf` in lockstep with `totalStaked`
   (audit findings ss14m1 / ss14l8). The underwater guard is ON, matching `withdraw` — this is a
   voluntary exit, not an escape hatch.
+- **The exit haircut is sized, measured, and charged to the caller** (round 2). A strategy that
+  sells its position on exit — `ERC4626MarketYieldStrategy` always does — delivers less than it
+  is asked for. `autoAnnihilate` quotes `IYieldStrategy.previewExitFor(token, address(this),
+  netWanted)` (vault-RM story 050) for the **gross** it must request, caps that **gross** (never
+  the net) at the caller's own `user.amount`, and debits `user.amount` and `pool.totalStaked` by
+  it. The Antimatter the haircut displaced joins `excess` and is minted straight to the caller.
+  Worked example: 100 of principal against 100 of Antimatter — gross-withdraw 100, receive 98,
+  annihilate 98, mint 2. Three things about this are load-bearing:
+  - **Capping the gross, not the net, is what keeps the whole-position caller from underflowing**
+    `user.amount`. The net cap looks equivalent and is not.
+  - **The preview is advisory only.** It reads live AMM state and is manipulable within a block,
+    and it is built on the fee-free `convertToAssets` (vault-RM story 049 — `previewRedeem` is
+    unusable because Autopool-style vaults mutate state inside it and trap under `STATICCALL`),
+    so it over-quotes on a fee-charging vault. The real balance delta across the exit is
+    therefore **measured**, and a delivery below the pro-rated guarantee reverts
+    `"StableStaker: exit shortfall"`. A lying preview must fail the transaction.
+  - **The idle buffer is never the payer.** Charging the net and letting the shortfall fall on
+    the contract's idle balance socialises one caller's routine exit loss across every staker,
+    because that balance is the shared underwater-withdrawal buffer. Symmetrically, anything the
+    exit over-delivers is forwarded to the caller rather than left to grow the buffer at their
+    expense. The user absorbing their own haircut is the same outcome as withdrawing manually and
+    annihilating in their own wallet, and every other principal-moving path (`withdraw`,
+    `emergencyWithdraw`) already works this way.
+
+  A strategy that can guarantee nothing at all — the market strategy at a 100% slippage
+  tolerance, which answers `(0, 0)` to every preview — makes `autoAnnihilateAvailable(token)`
+  false and `autoAnnihilate` revert, rather than minting the whole reward raw through the
+  `excess` path and handing the caller a bypass of a closed `claim`.
+- **Self-sandwiching is bounded and accepted.** A worse AMM rate annihilates less and mints more
+  raw Antimatter, which is what the closed `claim` exists to prevent — but
+  `ERC4626MarketYieldStrategy` enforces its own `minOut` from `slippageToleranceBps` and reverts
+  before `autoAnnihilate` sees the proceeds, so the extractable amount is capped at the tolerance
+  and costs a real AMM round trip. Ordinary sandwiching of the exit is not new: a plain
+  `withdraw` sells into the same AMM with the same protection.
 - **`PoolState.Active` is required**, unlike `claim`, because this moves principal and would
   otherwise corrupt the terminal-migration `P` snapshot.
 - **Registered-stable coupling.** `Antimatter.toStableAmount` reverts `StablecoinNotRegistered`
@@ -452,7 +486,10 @@ Plain git submodules under `lib/` (no "mutable dependency" mechanism):
 - `lib/pauser` — phoenix project, tracks `master` HEAD.
 - `lib/reflax-yield-vault` — phoenix project, tracks `master` HEAD. Provides
   `IYieldStrategy` / `AYieldStrategy` / `ERC4626YieldStrategy` (see "Yield strategies" above).
-  Remapped as `reflax-yield-vault/=lib/reflax-yield-vault/src/`.
+  Remapped as `reflax-yield-vault/=lib/reflax-yield-vault/src/`. Pinned at `cdd0743`, which is
+  where `IYieldStrategy.previewExitFor` arrives (vault-RM story 050); `autoAnnihilate` needs it,
+  and every direct implementer of the interface in this repo's tests must declare it or the
+  suite will not compile.
 
 Remappings live in `foundry.toml` and `remappings.txt`. OZ v5.6.1 requires `solc >= 0.8.24`;
 the project pins `solc = "0.8.28"`.
