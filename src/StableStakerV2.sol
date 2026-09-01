@@ -9,6 +9,7 @@ import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "./interfaces/IAntimatter.sol";
+import "./interfaces/IPhUSD.sol";
 import "pauser/interfaces/IPausable.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import "./interfaces/IStableStaker.sol";
@@ -1067,6 +1068,58 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         return grossQuote > 0;
     }
 
+    /**
+     * @notice The phUSD token this staker may mint, read LIVE off Antimatter on every call.
+     * @dev Deliberately NOT a constructor argument and NOT cached. `Antimatter.phUSD` is mutable —
+     *      the owner may rotate it via `setPhUSD(IFlax)` — so a cached value would silently point at
+     *      a dead token after a legitimate rotation. This mirrors {_antimatterScale}, which reads
+     *      decimals live for the same reason: a live read that reverts fails closed, a stale cache
+     *      misbehaves silently. Reading in the constructor would additionally require Antimatter to
+     *      be fully wired before the staker is deployed, which the deployment runbook does not
+     *      guarantee, and would break every test that constructs the staker against a bare stand-in.
+     *
+     *      Returns `address(0)` when Antimatter's phUSD is unset. Callers that intend to MINT must
+     *      go through {_phUSD}, which fails closed instead.
+     */
+    function phUSDToken() public view returns (address) {
+        return antimatter.phUSD();
+    }
+
+    /**
+     * @notice True when this staker can actually mint phUSD right now.
+     * @dev The gate on phUSD's `mint` has TWO conditions and the second is a live operational
+     *      hazard: `canMint` must be set for this contract AND the `mintVersion` recorded at the
+     *      grant must still equal phUSD's current global `mintVersion`. phUSD's owner can call
+     *      `revokeAllMintPrivileges()`, which bumps that global counter and de-authorises EVERY
+     *      minter at once with no per-minter transaction — so a `canMint`-only probe reports a false
+     *      positive for a staker whose rights have already evaporated.
+     *
+     *      Staticcalled rather than called directly so that an unset, non-contract or ABI-divergent
+     *      phUSD answers `false` instead of reverting the caller. Nothing in this contract consumes
+     *      this yet; it exists so the shortfall path can degrade rather than assume, and so the
+     *      capability is observable and testable before its consumer lands.
+     */
+    function phUSDMintAvailable() public view returns (bool) {
+        address token = phUSDToken();
+        if (token == address(0)) {
+            return false;
+        }
+        (bool infoOk, bytes memory infoData) =
+            token.staticcall(abi.encodeCall(IPhUSD.authorizedMinters, (address(this))));
+        if (!infoOk || infoData.length != 64) {
+            return false;
+        }
+        IPhUSD.MinterInfo memory info = abi.decode(infoData, (IPhUSD.MinterInfo));
+        if (!info.canMint) {
+            return false;
+        }
+        (bool versionOk, bytes memory versionData) = token.staticcall(abi.encodeCall(IPhUSD.mintVersion, ()));
+        if (!versionOk || versionData.length != 32) {
+            return false;
+        }
+        return info.mintVersion == abi.decode(versionData, (uint256));
+    }
+
     // ============================== INTERNAL ==============================
 
     /// @dev Accrue rewards for `token` up to the current block. Empty pools accrue nothing.
@@ -1124,6 +1177,16 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         uint8 dec = IERC20Metadata(token).decimals();
         require(dec <= 18, "StableStaker: unsupported decimals");
         return 10 ** (18 - dec);
+    }
+
+    /// @dev Resolve the phUSD token as {IPhUSD}, failing closed when Antimatter's phUSD is unset.
+    ///      This is the only path a MINT may take: {phUSDToken} is the observable view and answers
+    ///      `address(0)` rather than reverting, which is the wrong answer for a caller about to
+    ///      hand a mint to it. Read live, per the reasoning on {phUSDToken}.
+    function _phUSD() internal view returns (IPhUSD) {
+        address token = phUSDToken();
+        require(token != address(0), "StableStaker: phUSD unset on antimatter");
+        return IPhUSD(token);
     }
 
     /// @dev The strategy is below par for the farm's position when its total balance (principal +

@@ -4,8 +4,10 @@ pragma solidity ^0.8.20;
 /**
  * @title IAntimatter
  * @notice Minimal view of the Antimatter emissions token that StableStakerV2 needs.
- * @dev StableStakerV2 touches Antimatter at four call sites: `mint` (claim, the terminal-migration
- *      exit, and both halves of {StableStakerV2-autoAnnihilate}), `annihilate` and `toStableAmount`.
+ * @dev StableStakerV2 touches Antimatter at five call sites: `mint` (claim, the terminal-migration
+ *      exit, and both halves of {StableStakerV2-autoAnnihilate}), `annihilate`, `toStableAmount`,
+ *      and `phUSD` (read live by {StableStakerV2-phUSDToken} to resolve the token the staker may
+ *      mint to cover an {StableStakerV2-autoAnnihilate} exit shortfall).
  *      Declaring the surface locally keeps `src/` free of the antimatter repo's transitive phUSD,
  *      phUSD-minter and pauser imports; the concrete `Antimatter` is deployed only in tests, against
  *      the `lib/antimatter` submodule.
@@ -44,4 +46,16 @@ interface IAntimatter {
      *      the scaling itself is done locally against the token's own `decimals()`.
      */
     function toStableAmount(address stable, uint256 amount) external view returns (uint256);
+
+    /**
+     * @notice The phUSD token Antimatter mints against.
+     * @dev Declared as `address`, NOT as a phUSD type: the ABI encoding of a getter returning
+     *      `IFlax` is identical, and `address` keeps this interface free of any phUSD import, which
+     *      is exactly the property the note above claims. On Antimatter the storage is
+     *      `IFlax public phUSD;` and it is MUTABLE — the owner may rotate it via `setPhUSD(IFlax)`,
+     *      which cross-checks the stable minter and reverts `PhUSDMinterMismatch` on disagreement.
+     *      {StableStakerV2-phUSDToken} therefore reads it live and never caches it; a cache would
+     *      silently point at a dead token after a legitimate rotation.
+     */
+    function phUSD() external view returns (address);
 }

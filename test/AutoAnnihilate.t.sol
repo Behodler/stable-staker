@@ -75,6 +75,10 @@ contract AutoAnnihilateTest is Test {
 
         staker = new StableStakerV2(IAntimatter(address(antimatter)), owner);
         antimatter.setApprovedMinter(address(staker), true);
+        // Story 026: the staker may mint phUSD, solely to cover an under-delivering exit in
+        // {StableStakerV2-autoAnnihilate}. Antimatter remains the reward token; nothing consumes
+        // this grant until story 028.
+        phUSD.setMinter(address(staker), true);
 
         staker.addToken(address(usdc));
         staker.addToken(address(dai));

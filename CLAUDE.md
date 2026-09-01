@@ -16,11 +16,21 @@ or any Antimatter revert, can no longer brick a principal path.
 **Antimatter**. The byte-frozen `src/versions/v1/StableStakerV1.sol` emits **phUSD** and always
 will — the live mainnet V1 instance is deployed and unpatchable, so that is correct and permanent,
 not an oversight. V2 holds only a minimal local `src/interfaces/IAntimatter.sol`
-(`mint(address,uint256)` and nothing else); the concrete `Antimatter` is deployed in tests from
-`lib/antimatter`. Authorization is Antimatter's owner-managed whitelist,
+(`mint`, `annihilate`, `toStableAmount` and `phUSD` — nothing more); the concrete `Antimatter` is
+deployed in tests from `lib/antimatter`. Authorization is Antimatter's owner-managed whitelist,
 `setApprovedMinter(address,bool)`, and an unapproved caller reverts with the custom error
 `NotApprovedMinter(address)` — there is no phUSD-style `mintVersion` mass revocation, so
 per-minter `setApprovedMinter(x, false)` is the only way to revoke.
+
+**V2 can also mint phUSD, and that is not a reversal of the above (story 026).** The pivot stands:
+Antimatter is the sole reward token for claims, withdrawals, deposits, APY accounting and
+migration, and nothing about what a staker earns changed. V2 holds a second minimal local
+interface, `src/interfaces/IPhUSD.sol` (`mint`, plus `mintVersion` and `authorizedMinters`, which
+together form the probe `phUSDMintAvailable()`), for exactly one purpose: covering the shortfall
+when `autoAnnihilate`'s yield-strategy exit under-delivers, shifting that exit slippage onto the
+protocol as phUSD inflation rather than onto the annihilating user. The token is resolved live via
+`phUSDToken()` off Antimatter's mutable `phUSD`, never cached and never a constructor argument.
+Story 026 added the capability and no consumer; story 028 is the consumer.
 
 **Naming.** flax-token-v2 is called **phUSD**, never "flax" — mirroring `antimatter/CLAUDE.md`.
 `pxUSD` is an unrelated third-party token and never belongs in this repo.
@@ -206,16 +216,31 @@ unobtainable while the flag is false.
 
 1. Deploy `StableStakerV2(antimatter, owner)`.
 2. Antimatter owner calls `antimatter.setApprovedMinter(address(staker), true)`.
-3. `staker.addToken(token)` for each stable, then `staker.antimatterPerDay(token, amountPerDay)`.
-4. Optional: `staker.setPauser(pauser)`, `staker.setMigrator(migrator)`.
-5. Register each pool token with `PhusdStableMinter` (`registerStablecoin` + `approveYS`), or
+3. phUSD owner calls `phUSD.setMinter(address(staker), true)`. **This is not a reward-token
+   change.** Antimatter remains the sole thing a staker earns; the phUSD grant exists ONLY so that
+   `autoAnnihilate` can cover a yield-strategy exit shortfall out of protocol inflation instead of
+   shortchanging the annihilating user. Read `staker.phUSDMintAvailable()` back afterwards — it is
+   the two-condition probe (`canMint` AND a current `mintVersion`) and is the only honest check
+   that the grant took. Note that `staker.phUSDToken()` resolves live off `antimatter.phUSD()`, so
+   this step must come after Antimatter's `setPhUSD`, and a later `setPhUSD` rotation needs the
+   grant re-issued on the incoming token.
+4. `staker.addToken(token)` for each stable, then `staker.antimatterPerDay(token, amountPerDay)`.
+5. Optional: `staker.setPauser(pauser)`, `staker.setMigrator(migrator)`.
+6. Register each pool token with `PhusdStableMinter` (`registerStablecoin` + `approveYS`), or
    `autoAnnihilate` is unavailable for it — check with `staker.autoAnnihilateAvailable(token)`.
-6. `claimEnabled` starts **false** and is meant to stay false for the teaching phase; open it with
+7. `claimEnabled` starts **false** and is meant to stay false for the teaching phase; open it with
    `staker.setClaimEnabled(true)` when the phase ends, or for the duration of an antimatter pause.
 
+Beware `phUSD.revokeAllMintPrivileges()`: it bumps a GLOBAL `mintVersion` and de-authorises every
+minter at once, with no per-minter transaction and no event naming the staker. Step 3 has to be
+re-run after any such sweep, and `phUSDMintAvailable()` is what detects it.
+
 For migration, both old and new stakers must have the migrator set (`setMigrator`) and the new
-staker must have the token registered (`addToken`); the new staker must also be an approved minter
-on its own reward token (Antimatter for V2 and onward, phUSD for the frozen V1).
+staker must have the token registered (`addToken`). V2 and onward need **both** grants: approved
+minter on Antimatter, which is the reward token, and phUSD minter rights, which are purely
+shortfall cover for `autoAnnihilate`. The frozen V1 needs only phUSD, which *was* its reward token
+— the two grants mean entirely different things on the two versions and V2 holding phUSD rights is
+not a partial reversal of the emissions pivot.
 
 ## Yield strategies (per-token principal custody)
 
