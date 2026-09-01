@@ -16,8 +16,8 @@ or any Antimatter revert, can no longer brick a principal path.
 **Antimatter**. The byte-frozen `src/versions/v1/StableStakerV1.sol` emits **phUSD** and always
 will — the live mainnet V1 instance is deployed and unpatchable, so that is correct and permanent,
 not an oversight. V2 holds only a minimal local `src/interfaces/IAntimatter.sol`
-(`mint`, `annihilate`, `toStableAmount` and `phUSD` — nothing more); the concrete `Antimatter` is
-deployed in tests from `lib/antimatter`. Authorization is Antimatter's owner-managed whitelist,
+(`mint`, `annihilate`, `toStableAmount`, `phUSD` and `phUSDMinter` — nothing more); the concrete
+`Antimatter` is deployed in tests from `lib/antimatter`. Authorization is Antimatter's owner-managed whitelist,
 `setApprovedMinter(address,bool)`, and an unapproved caller reverts with the custom error
 `NotApprovedMinter(address)` — there is no phUSD-style `mintVersion` mass revocation, so
 per-minter `setApprovedMinter(x, false)` is the only way to revoke.
@@ -30,7 +30,13 @@ together form the probe `phUSDMintAvailable()`), for exactly one purpose: coveri
 when `autoAnnihilate`'s yield-strategy exit under-delivers, shifting that exit slippage onto the
 protocol as phUSD inflation rather than onto the annihilating user. The token is resolved live via
 `phUSDToken()` off Antimatter's mutable `phUSD`, never cached and never a constructor argument.
-Story 026 added the capability and no consumer; story 028 is the consumer.
+Story 026 added the capability and no consumer; **story 028 is the consumer** — it is the only
+place in the codebase that mints phUSD, and it does so only to cover an exit shortfall. Story 028
+added a third minimal local interface, `src/interfaces/IPhusdStableMinter.sol`
+(`calculateMintAmount` alone), reached by the two-hop live read `antimatter.phUSDMinter()` ->
+`calculateMintAmount`, which is how the frictionless payout is priced. A reader who finds phUSD
+minting in V2 and infers a dual-emissions design has inferred wrong: see
+"The claim gate and `autoAnnihilate`" below.
 
 **Naming.** flax-token-v2 is called **phUSD**, never "flax" — mirroring `antimatter/CLAUDE.md`.
 `pxUSD` is an unrelated third-party token and never belongs in this repo.
@@ -93,15 +99,22 @@ accrual — no new path writes `accAntimatterPerShare` — so the cap holds a fo
 total via `claimableReward`; `pendingReward` remains projection-only and excludes the backlog. See
 `test/EmissionCap.t.sol` and `test/DeferredAccrual.t.sol`.
 
-## The claim gate and `autoAnnihilate` (story 025)
+## The claim gate and `autoAnnihilate` (stories 025, 028)
 
 `claim()` is gated by an owner-settable `claimEnabled` flag and is **false on deployment**.
-While it is down, `autoAnnihilate(address token, uint256 minPhUSDOut)` is the reward path:
-it mints the caller's owed Antimatter to the staker itself, annihilates it against a slice of
-the caller's **own booked principal**, decrements `userInfo.amount` and `poolInfo.totalStaked`
-by the stable half, and Antimatter mints the resulting phUSD straight to the caller. The staker
-watches their principal decline and receives phUSD for it, so annihilation becomes something
-they have done rather than something they have read about.
+While it is down, `autoAnnihilate(address token)` is the reward path: it mints the caller's owed
+Antimatter to the staker itself, annihilates it against a slice of the caller's **own booked
+principal**, decrements `userInfo.amount` and `poolInfo.totalStaked` by the stable half, and pays
+the resulting phUSD to the caller. The staker watches their principal decline and receives phUSD
+for it, so annihilation becomes something they have done rather than something they have read
+about.
+
+Story 028 removed the caller-supplied `minPhUSDOut` from the signature — a **breaking ABI change**,
+free because V2 is undeployed and `phase-2-staging` has no V2 deploy script. The caller gains
+nothing from a floor on a payout StableStaker itself now guarantees. It is not dropped to zero: an
+exact floor, sized against the amount actually being annihilated, is still handed to Antimatter,
+because it remains the only in-path guard against the exchange rate moving or a mint cap biting
+between the quote and the burn.
 
 This is a **teaching phase, not a permanent design**. `setClaimEnabled(true)` reopens `claim`
 in one transaction with no redeploy, which is the entire reason the gate is a flag.
@@ -124,14 +137,59 @@ Mechanics worth knowing before touching this code:
   `relinquishPrincipal` is what keeps `strategy.principalOf` in lockstep with `totalStaked`
   (audit findings ss14m1 / ss14l8). The underwater guard is ON, matching `withdraw` — this is a
   voluntary exit, not an escape hatch.
-- **The exit shortfall is measured, never quoted.** A strategy that sells its position on exit —
-  `ERC4626MarketYieldStrategy` always does — delivers less than it is asked for. `autoAnnihilate`
-  requests exactly the net the annihilation needs (already capped at the caller's own
-  `user.amount`), debits `user.amount` and `pool.totalStaked` by that request, and then takes
-  `_routeExit`'s **measured balance delta** as the amount it may actually annihilate. The
-  Antimatter the shortfall displaced joins `excess` and is minted straight to the caller. Worked
-  example: 100 of principal against 100 of Antimatter — withdraw 100, receive 98, annihilate 98,
-  mint 2. Two things about this are load-bearing:
+- **The exit shortfall is measured, then COVERED BY THE PROTOCOL in freshly minted phUSD**
+  (story 028). A strategy that sells its position on exit — `ERC4626MarketYieldStrategy` always
+  does — delivers less than it is asked for. `autoAnnihilate` requests exactly the net the
+  annihilation needs (already capped at the caller's own `user.amount`), debits `user.amount` and
+  `pool.totalStaked` by that request, takes `_routeExit`'s **measured balance delta** as the amount
+  it may actually annihilate — and then pays the caller what a **frictionless** annihilation would
+  have paid, minting the difference as new phUSD. Worked example, 100 of principal against 100 of
+  Antimatter at a 3% exit haircut:
+
+  ```
+  request      100 U from the yield strategy
+  received      97 U          (measured balance delta; 3 U lost to the exit)
+  mint           97 A         to the staker itself
+  annihilate     97 A + 97 U  ->  194 phUSD delivered
+  frictionless  100 A + 100 U ->  200 phUSD
+  staker mints    6 phUSD     the deficit
+  --------------------------------------------------------------
+  the caller receives 200 phUSD, is debited 100 U of principal and 100 A of accrual
+  ```
+
+  This deliberately shifts slippage risk off the user and onto the protocol, as a gift funded by
+  phUSD inflation. It buys back a whole class of complexity: no exit preview, no gross-up
+  arithmetic, no shortfall floor, no rounding allowance, and no revert path for an under-delivering
+  strategy. All divisions floor, always in the protocol's favour — 199.999 phUSD instead of 200 is
+  correct and accepted. **Antimatter remains the sole reward token**; phUSD minting happens here
+  and nowhere else.
+
+  **Do not read the payout as `2 x annihilated`.** That identity holds only while the stable
+  minter's `exchangeRate` is exactly `1e18`, which is what the test fixture happens to register.
+  The target is computed: `netWanted * scale + phUSDMinter.calculateMintAmount(token, netWanted)`,
+  reached by a two-hop live read `antimatter.phUSDMinter()` -> `calculateMintAmount`, declared
+  locally as `src/interfaces/IPhusdStableMinter.sol`. The concrete `PhusdStableMinter` is never
+  imported into `src/`: it carries two relative imports into a **third** level of submodule nesting.
+
+  **A returned quote is not a promise.** `calculateMintAmount` ignores `enabled`, the minter's own
+  pause and the rolling 24h `maxMintPerDay` cap, and returns 0 rather than reverting for an
+  unregistered stablecoin. So the target is computed from it but what was actually **delivered** is
+  derived by measuring a phUSD balance delta — `annihilate` is called with `recipient =
+  address(this)` precisely so that delta exists. That is the same discipline `Antimatter.annihilate`
+  applies to the minter one level down. `PhusdStableMinter` is therefore a **third** pause surface,
+  beyond Antimatter's and StableStaker's own; a cap or pause biting there reverts the whole call
+  atomically, and the caller keeps their principal and accrual.
+
+  **The top-up fails closed.** If the deficit cannot be minted — `phUSDMintAvailable()` false,
+  which `phUSD.revokeAllMintPrivileges()` can cause with no transaction ever touching this
+  contract — the call reverts `"StableStaker: phUSD mint unavailable"` rather than silently falling
+  back to minting the displaced Antimatter raw. Reverting was chosen over the fallback because the
+  fallback pays a different asset than the caller was promised and hides an operational fault. The
+  cost is that a revoked grant closes the reward path while `claimEnabled` is false — the same shape
+  as the two-pause deadlock below, with the same answer, `setClaimEnabled(true)`. A frictionless
+  exit needs no top-up and is unaffected.
+
+  Two things about the measurement are load-bearing:
   - **There is no advance quote.** An earlier design (vault-RM story 050) sized the request from
     `IYieldStrategy.previewExitFor` and reverted `"StableStaker: exit shortfall"` when delivery
     fell below the quoted floor. Both the interface function and the floor were reverted out
@@ -140,15 +198,17 @@ Mechanics worth knowing before touching this code:
     independent ways and made `autoAnnihilate` revert on essentially every call against a plain
     ERC4626 vault that had accrued yield — which with `claimEnabled` false is the only reward
     path there is. Measuring the delta needs no quote and cannot be lied to.
-  - **INTERIM, story 027 only**: the displaced Antimatter is minted raw to the caller, which
-    widens the documented hole in the closed `claim` gate by the size of the shortfall. Story 028
-    closes it by paying the shortfall as freshly minted phUSD instead. Accepted for one story
-    because nothing is deployed.
-  - **The idle buffer is never the payer** *on a solvent strategy*. Charging the net and letting
-    the shortfall fall on the contract's idle balance socialises one caller's routine exit loss across every staker,
-    because that balance is the shared underwater-withdrawal buffer. This now holds *by
-    construction* rather than by a floor check: only the measured `netUsed` is ever approved and
-    annihilated. Symmetrically, anything the
+  - **The displaced Antimatter is no longer minted raw** (story 028, superseding the story-027
+    interim). Its value arrives as phUSD instead, so `excess` now carries exactly one thing:
+    reward that outran the caller's principal outright. See the auditor note below.
+  - **The idle buffer is never the payer** *on a solvent strategy*, and story 028 does not change
+    that. Letting the shortfall fall on the contract's idle balance would socialise one caller's
+    routine exit loss across every staker, because that balance is the shared
+    underwater-withdrawal buffer. This holds *by construction* rather than by a floor check: only
+    the measured `netUsed` is ever approved and annihilated, and the top-up is **freshly minted
+    phUSD, not a draw on any pooled asset**, so no other staker's position moves. That invariant is
+    asserted directly against a deliberately fat buffer across the whole haircut grid in
+    `test/AutoAnnihilate.t.sol`. Symmetrically, anything the
     exit over-delivers is forwarded to the caller rather than left to grow the buffer at their
     expense. The user absorbing their own haircut is the same outcome as withdrawing manually and
     annihilating in their own wallet, and every other principal-moving path (`withdraw`,
@@ -161,16 +221,19 @@ Mechanics worth knowing before touching this code:
     "idle balance is automatically buffer" above — but it means "the buffer is untouched" is a
     statement about the normal path, not an invariant of every call.
 
-  A strategy that can guarantee nothing at all — the market strategy at a 100% slippage
-  tolerance, which answers `(0, 0)` to every preview — makes `autoAnnihilateAvailable(token)`
-  false and `autoAnnihilate` revert, rather than minting the whole reward raw through the
-  `excess` path and handing the caller a bypass of a closed `claim`.
-- **Self-sandwiching is bounded and accepted.** A worse AMM rate annihilates less and mints more
-  raw Antimatter, which is what the closed `claim` exists to prevent — but
-  `ERC4626MarketYieldStrategy` enforces its own `minOut` from `slippageToleranceBps` and reverts
-  before `autoAnnihilate` sees the proceeds, so the extractable amount is capped at the tolerance
-  and costs a real AMM round trip. Ordinary sandwiching of the exit is not new: a plain
-  `withdraw` sells into the same AMM with the same protection.
+  There is no strategy-side availability condition left: delivery is measured, never pre-judged, so
+  even a strategy that delivers nothing at all simply makes the whole payout a top-up.
+  `autoAnnihilateAvailable(token)` answers only the stable-minter registration question.
+- **Self-sandwiching is bounded, extractable, and ACCEPTED — this is the front-running note.** A
+  caller who sandwiches their own `autoAnnihilate` through `ERC4626MarketYieldStrategy`'s AMM keeps
+  the sandwich profit **and** is still paid the frictionless figure, because the protocol mints the
+  difference. It is bounded three ways: the strategy enforces its own `minOut` from
+  `slippageToleranceBps` and reverts below it, so extraction per call is capped at the configured
+  tolerance; it costs a real AMM round trip; and it is bounded by the caller's own stake and
+  accrual. Shifting exit slippage onto the protocol is the explicit goal, so this is priced in
+  rather than defended against. **The operational lever is `slippageToleranceBps` — set it as
+  tightly as the market allows.** Ordinary sandwiching of the exit is not new: a plain `withdraw`
+  sells into the same AMM with the same protection.
 - **`PoolState.Active` is required**, unlike `claim`, because this moves principal and would
   otherwise corrupt the terminal-migration `P` snapshot.
 - **Registered-stable coupling.** `Antimatter.toStableAmount` reverts `StablecoinNotRegistered`
@@ -181,13 +244,20 @@ Mechanics worth knowing before touching this code:
   contract's custom error.
 - **The migration carve-out.** The Antimatter mint inside `_exitPosition` is deliberately **not**
   gated by `claimEnabled`. Gating it would let a closed claim gate brick migration.
-- **The two-pause deadlock.** `Antimatter.annihilate` is `whenNotPaused` against *Antimatter's*
-  own Phoenix pauser, which StableStaker does not control. With `claimEnabled == false`, an
-  antimatter-side pause leaves stakers with no reward path at all. The intended response is
+- **The THREE pause surfaces.** `Antimatter.annihilate` is `whenNotPaused` against *Antimatter's*
+  own Phoenix pauser, which StableStaker does not control; `PhusdStableMinter` has a third pauser
+  of its own (plus a per-stablecoin `enabled` flag and a rolling 24h `maxMintPerDay` cap), reached
+  on every annihilation. With `claimEnabled == false`, a pause on any of them leaves stakers with
+  no reward path at all. The intended response is
   operational, not a code path: **the owner flips `claimEnabled` to true for the duration of any
   antimatter pause.** That is an obligation on whoever holds the StableStaker owner key.
 
 ### Auditor note — annihilation exceeding principal
+
+**Scope, since story 028**: this note is about reward that outran the caller's principal *outright*
+and nothing else. The earlier, wider version of it also covered the Antimatter an exit shortfall
+displaced; that is superseded — a shortfall no longer displaces anything into raw Antimatter,
+because the protocol tops the payout up in phUSD instead. `excess` now has exactly one source.
 
 When a user's claimable antimatter exceeds their booked principal, the excess cannot be
 annihilated — there is no principal left to annihilate it against. Of the available responses

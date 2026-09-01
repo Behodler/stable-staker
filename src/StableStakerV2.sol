@@ -10,6 +10,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "./interfaces/IAntimatter.sol";
 import "./interfaces/IPhUSD.sol";
+import "./interfaces/IPhusdStableMinter.sol";
 import "pauser/interfaces/IPausable.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 import "./interfaces/IStableStaker.sol";
@@ -166,20 +167,27 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     event PoolReset(address indexed token);
     event ClaimEnabledSet(bool enabled);
 
-    /// @notice Emitted by {autoAnnihilate}. `antimatterBurned` is the 18-decimal amount annihilated,
-    ///         `principalConsumed` is the booked principal the caller gave up for it (in `token`
-    ///         decimals) — which under a strategy that sells on exit is MORE than the stable half the
-    ///         annihilation consumed, because the exit delivered less than was requested and only what
-    ///         arrived is annihilated — and `excessMinted` is the reward that could not be annihilated
-    ///         (it outran the principal, or the exit shortfall displaced it) and was minted straight to
-    ///         the caller. Sub-unit dust appears in none of the three: it stays booked in
-    ///         {unclaimedReward}.
+    /// @notice Emitted by {autoAnnihilate}.
+    ///         `antimatterBurned` is the 18-decimal amount actually annihilated, i.e. sized against
+    ///         what the exit DELIVERED. `principalConsumed` is simply the principal the caller
+    ///         requested and was debited (in `token` decimals) — it carries no haircut interpretation
+    ///         any more: the exit shortfall is absorbed by the protocol rather than by the caller, so
+    ///         the two figures diverging is an exit haircut and nothing else.
+    ///         `excessMinted` is reward that OUTRAN the caller's principal outright and was minted as
+    ///         raw antimatter, exactly as a claim would; shortfall-displaced reward no longer appears
+    ///         here, because its value arrives as phUSD instead.
+    ///         `phUSDPaid` is the total phUSD transferred to the caller, and `phUSDMinted` is the part
+    ///         of it the protocol FRESHLY MINTED to cover the exit shortfall — the protocol's
+    ///         inflation, made greppable on chain. `phUSDMinted == 0` is the frictionless case.
+    ///         Sub-unit dust appears in none of them: it stays booked in {unclaimedReward}.
     event AutoAnnihilated(
         address indexed token,
         address indexed user,
         uint256 antimatterBurned,
         uint256 principalConsumed,
-        uint256 excessMinted
+        uint256 excessMinted,
+        uint256 phUSDPaid,
+        uint256 phUSDMinted
     );
 
     /// @notice Emitted once by EVERY initiateMigration, including a clean one. `claimed` is the pool's
@@ -431,7 +439,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
 
     /**
      * @notice Annihilate the caller's owed Antimatter for `token` against their OWN booked principal
-     *         and receive phUSD. The staked position shrinks by exactly the stable half consumed.
+     *         and receive phUSD — the FULL frictionless payout, with the protocol absorbing whatever
+     *         the yield-strategy exit lost on the way out.
      * @dev The reward path while {claimEnabled} is false, and the point of the teaching phase:
      *      annihilation becomes something the staker has done rather than something they have read
      *      about. Reward arithmetic is byte-identical to {claim} (settle, read
@@ -447,37 +456,53 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
      *           accrues to the next call, so it is neither stranded nor a dust-sized bypass of a
      *           disabled {claim}, and it rounds in the protocol's favour.
      *        4. Reward that OUTRUNS the caller's principal cannot be annihilated (there is no
-     *           principal left to annihilate it against) and is minted straight to them, exactly as a
-     *           claim would. A knowing, documented loophole around the gate — see CLAUDE.md. The
-     *           alternative, reverting, strands a user whose rewards outgrew their stake.
+     *           principal left to annihilate it against) and is minted straight to them as raw
+     *           antimatter, exactly as a claim would. A knowing, documented loophole around the gate —
+     *           see CLAUDE.md. The alternative, reverting, strands a user whose rewards outgrew their
+     *           stake. This is now the ONLY thing `excess` carries.
      *        5. The stable half is sourced through {_routeExit}, never from the raw idle balance: with
      *           a strategy set the stable lives in the strategy, and the buffer path's
      *           `relinquishPrincipal` is what keeps `strategy.principalOf` in lockstep with
      *           `totalStaked`.
-     *        6. Antimatter burns the CALLER's own balance, so the reward is minted to `address(this)`,
-     *           the stable half is approved to Antimatter, and `recipient` is the user: the phUSD
-     *           lands in their wallet with no second transfer. The approval is reset to zero after.
+     *        6. Antimatter burns the CALLER's own balance, so the reward is minted to `address(this)`
+     *           and the stable half is approved to Antimatter. `recipient` is `address(this)` as well,
+     *           so the delivered phUSD can be MEASURED before the caller is paid; the approval is
+     *           reset to zero after. See {_annihilateAndTopUp}.
      *
-     *      EXIT SHORTFALL: MEASURE, NEVER QUOTE. A strategy that sells its position on exit — the
-     *      market strategy always does — delivers LESS than it is asked for. Requesting the net the
-     *      annihilation needs and burning that net anyway would silently pay the difference out of
-     *      this contract's idle balance, which is the SHARED underwater-withdrawal buffer: one
-     *      caller's routine exit loss socialised across every staker. So instead:
-     *        a. The exit requests exactly `netWanted`, which is already capped at the caller's own
-     *           principal, and `user.amount` / `pool.totalStaked` are debited by that request — the
-     *           caller is written down what they asked the strategy to give up, exactly as {withdraw}
-     *           does. This is the same outcome as withdrawing manually and annihilating in their own
-     *           wallet.
+     *      THE PROTOCOL COVERS THE EXIT SHORTFALL, IN FRESHLY MINTED phUSD. A strategy that sells its
+     *      position on exit — the market strategy always does — delivers LESS than it is asked for.
+     *      The caller is nonetheless paid what a frictionless annihilation would have paid:
+     *        a. The exit requests exactly `netWanted`, already capped at the caller's own principal,
+     *           and `user.amount` / `pool.totalStaked` are debited by that request — exactly as
+     *           {withdraw} does.
      *        b. {_routeExit} returns the MEASURED balance delta, and `netUsed` is clamped to it. Only
-     *           what actually arrived is ever approved and annihilated, so a shortfall can never be
-     *           made up out of the buffer — the property holds by construction rather than by a
-     *           floor check.
-     *        c. The Antimatter the shortfall displaced — the reward the shrunken net can no longer be
-     *           annihilated against — joins `excess` and is minted straight to the caller. INTERIM:
-     *           story 028 replaces that raw mint with a phUSD top-up.
-     *        d. Anything the exit OVER-delivers is forwarded to the caller: they were debited the
+     *           what actually arrived is ever approved and annihilated.
+     *        c. The caller's accrued antimatter is debited by the FULL `capped` amount, as if it had
+     *           all been minted and burned, whatever the exit delivered.
+     *        d. The frictionless target — `netWanted * scale` for the antimatter half plus
+     *           {IPhusdStableMinter-calculateMintAmount}`(token, netWanted)` for the stable half — is
+     *           compared against the phUSD actually delivered, and the protocol MINTS the difference.
+     *           The top-up is new phUSD, NOT a draw on this contract's idle stable balance: that
+     *           balance is the shared underwater-withdrawal buffer, and the invariant that
+     *           `autoAnnihilate` never spends a unit of it survives intact. No other staker's position
+     *           is touched by one caller's exit haircut.
+     *        e. Anything the exit OVER-delivers is forwarded to the caller: they were debited the
      *           request, so the surplus is theirs, and leaving it here would quietly grow the buffer
      *           at their expense.
+     *
+     *      Do NOT read the payout as `2 * annihilatable`. That holds only while the stable minter's
+     *      exchange rate is exactly `1e18`; the target is computed, never assumed.
+     *
+     *      THE TOP-UP IS EXTRACTABLE, AND THAT IS ACCEPTED. A caller who sandwiches their own exit
+     *      through an AMM-backed strategy keeps the sandwich profit AND is still paid the frictionless
+     *      figure. It is bounded by the strategy's own `slippageToleranceBps` (which reverts below its
+     *      floor), by a real AMM round trip, and by the caller's own stake and accrual. Shifting exit
+     *      slippage off the user and onto the protocol is the explicit goal; the operational lever is
+     *      `slippageToleranceBps`, set as tightly as the market allows. See CLAUDE.md.
+     *
+     *      ANTIMATTER REMAINS THE SOLE REWARD TOKEN. phUSD minting happens here and nowhere else, and
+     *      only to cover an exit shortfall. Nothing about emissions, APY, claims, withdrawals,
+     *      deposits or migration changes.
      *
      *      Gated on `PoolState.Active` like {stake} / {withdraw} / {emergencyWithdraw}, because unlike
      *      {claim} this moves principal and would corrupt the terminal-migration `P` snapshot.
@@ -485,11 +510,8 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
      *      control; the operational answer to that pause is {setClaimEnabled}(true).
      * @param token The pool token, which must ALSO be a registered stablecoin on the phUSD stable
      *              minter — see {autoAnnihilateAvailable}.
-     * @param minPhUSDOut The least phUSD the caller accepts across both halves, forwarded verbatim to
-     *              Antimatter. The stable minter's exchange rate is configurable and not guaranteed
-     *              1:1, so this is real slippage protection; passing zero waives it.
      */
-    function autoAnnihilate(address token, uint256 minPhUSDOut) external nonReentrant whenNotPaused poolExists(token) {
+    function autoAnnihilate(address token) external nonReentrant whenNotPaused poolExists(token) {
         require(poolState[token] == PoolState.Active, "StableStaker: pool not active");
         // Explicit and ahead of any state change, so the UI never has to interpret a foreign
         // contract's `StablecoinNotRegistered` custom error to tell "this token cannot be
@@ -500,7 +522,7 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         uint256 scale = _antimatterScale(token);
         uint256 netWanted; // the stable half the annihilation needs, in `token` decimals
         uint256 gross; // the principal the caller gives up to obtain it
-        uint256 excessBase; // reward that outran the principal outright; minted to the caller
+        uint256 excess; // reward that outran the principal outright; minted raw to the caller
 
         // Scoped so the intermediate arithmetic leaves the stack before the interactions below.
         {
@@ -517,8 +539,10 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
                 // toStableAmount reverts on a finer amount rather than rounding it away.
                 uint256 capped = owed < principalAsAntimatter ? owed : principalAsAntimatter;
                 netWanted = capped / scale;
-                excessBase = owed - capped;
-                require(netWanted > 0 || excessBase > 0, "StableStaker: nothing to annihilate");
+                // The ONLY excess left: reward with no principal to annihilate it against. The exit
+                // haircut no longer displaces anything, because the protocol tops the payout up.
+                excess = owed - capped;
+                require(netWanted > 0 || excess > 0, "StableStaker: nothing to annihilate");
                 // The sub-unit remainder, carried in the mapping rather than paid out.
                 unclaimedReward[token][msg.sender] = capped - netWanted * scale;
             }
@@ -541,38 +565,126 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         }
 
         // Interactions.
-        uint256 netUsed;
-        uint256 surplus;
+        uint256 annihilatable;
+        uint256 phUSDPaid;
+        uint256 phUSDMinted;
         if (gross > 0) {
             // Underwater guard ON, matching {withdraw}: this is a voluntary principal exit, not an
             // escape hatch, so it must not realize a loss the user did not opt into.
             uint256 received = _routeExit(token, gross, true);
             // MEASURED DELTA. {_routeExit} returns what actually arrived, which a selling strategy
-            // may haircut below the request. Only what arrived is ever annihilated, so the shortfall
-            // is never paid out of this contract's idle balance — the shared underwater buffer.
-            netUsed = received < netWanted ? received : netWanted;
-            surplus = received - netUsed;
-        }
-        uint256 annihilatable = netUsed * scale;
-        // Everything the annihilation could not consume: the reward that outran the principal
-        // (`owed - capped`) plus the reward the exit haircut displaced.
-        uint256 excess = excessBase + (netWanted - netUsed) * scale;
-
-        if (annihilatable > 0) {
-            antimatter.mint(address(this), annihilatable);
-            IERC20(token).forceApprove(address(antimatter), netUsed);
-            antimatter.annihilate(token, msg.sender, annihilatable, minPhUSDOut);
-            IERC20(token).forceApprove(address(antimatter), 0);
+            // may haircut below the request. Only what arrived is ever annihilated; the difference in
+            // VALUE is made up in freshly minted phUSD, never out of the idle buffer.
+            uint256 netUsed = received < netWanted ? received : netWanted;
+            annihilatable = netUsed * scale;
+            (phUSDPaid, phUSDMinted) = _annihilateAndTopUp(token, netUsed, netWanted, scale);
+            uint256 surplus = received - netUsed;
+            if (surplus > 0) {
+                // Over-delivery belongs to the caller, who was debited the request that produced it.
+                IERC20(token).safeTransfer(msg.sender, surplus);
+            }
         }
         if (excess > 0) {
             antimatter.mint(msg.sender, excess);
         }
-        if (surplus > 0) {
-            // Over-delivery belongs to the caller, who was debited the request that produced it.
-            IERC20(token).safeTransfer(msg.sender, surplus);
+
+        emit AutoAnnihilated(token, msg.sender, annihilatable, gross, excess, phUSDPaid, phUSDMinted);
+    }
+
+    /**
+     * @dev The phUSD half of {autoAnnihilate}: annihilate what the exit delivered, top the payout up
+     *      to what a frictionless annihilation would have paid, and pay the caller in one transfer.
+     *      Split out of {autoAnnihilate} to keep that function's stack shallow.
+     *
+     *      MEASURE, NEVER ASSUME. `recipient` is `address(this)` rather than the caller precisely so
+     *      the delivered phUSD can be read as a balance delta.
+     *      {IPhusdStableMinter-calculateMintAmount} is permissive — it ignores `enabled`, the minter's
+     *      own pause and the rolling 24h `maxMintPerDay` cap, and returns 0 rather than reverting for
+     *      an unregistered stablecoin — so a value it returns is a TARGET, not a guarantee. This
+     *      mirrors what `Antimatter.annihilate` does to the minter one level down.
+     *
+     *      `minPhUSDOut` is computed internally and is sized against `netUsed`, the amount actually
+     *      being annihilated, not against `netWanted`. The caller no longer supplies it: they gain
+     *      nothing from a floor on a payout this contract itself guarantees. It is NOT dropped to
+     *      zero, because it remains the only in-path guard against the exchange rate moving, or a
+     *      mint cap biting, between the quote and the burn — surrendering it would turn any such
+     *      movement into silent extra inflation.
+     *
+     *      FAIL CLOSED when the top-up cannot be minted. phUSD's `mint` has a two-condition gate and
+     *      the second is a live operational hazard: phUSD's owner can call `revokeAllMintPrivileges()`,
+     *      which bumps a global counter and de-authorises every minter at once, with no transaction
+     *      ever touching this contract. {phUSDMintAvailable} is that two-condition probe, and it is
+     *      checked BEFORE the mint so the caller sees `"StableStaker: phUSD mint unavailable"` rather
+     *      than a bare `"phUSD: ..."` string surfacing from a foreign contract. Reverting is
+     *      deliberate: the alternative — silently falling back to minting the displaced antimatter raw
+     *      — pays a different asset than the caller was promised and hides an operational fault. The
+     *      cost is that a revoked grant closes the reward path while {claimEnabled} is false, which is
+     *      the same shape as the documented two-pause deadlock and has the same answer,
+     *      {setClaimEnabled}(true). See CLAUDE.md.
+     * @param token The pool token being annihilated.
+     * @param netUsed The stable half that actually ARRIVED from the exit, in `token` decimals.
+     * @param netWanted The stable half that was REQUESTED, in `token` decimals. Sizes the target.
+     * @param scale `10 ** (18 - token.decimals())`.
+     * @return phUSDPaid Total phUSD transferred to the caller.
+     * @return phUSDMinted The part of it this contract freshly minted to cover the shortfall.
+     */
+    function _annihilateAndTopUp(address token, uint256 netUsed, uint256 netWanted, uint256 scale)
+        internal
+        returns (uint256 phUSDPaid, uint256 phUSDMinted)
+    {
+        IPhusdStableMinter stableMinter = _phUSDMinterContract();
+        uint256 delivered = _annihilateMeasured(token, netUsed, netUsed * scale, stableMinter);
+
+        // The frictionless payout: both halves of `netWanted`, as if the exit had lost nothing. The
+        // single truncation lives inside `calculateMintAmount` and floors, i.e. favours the protocol.
+        uint256 target = netWanted * scale + stableMinter.calculateMintAmount(token, netWanted);
+        // Delivery can only MEET the target at a fixed rate, never beat it, since `netUsed` is capped
+        // at `netWanted` and both halves are priced the same way. Guarded anyway: an underflow here
+        // would brick the reward path, and the branch costs one comparison.
+        phUSDMinted = target > delivered ? target - delivered : 0;
+        if (phUSDMinted > 0) {
+            require(phUSDMintAvailable(), "StableStaker: phUSD mint unavailable");
+            _phUSD().mint(address(this), phUSDMinted);
         }
 
-        emit AutoAnnihilated(token, msg.sender, annihilatable, gross, excess);
+        phUSDPaid = delivered + phUSDMinted;
+        if (phUSDPaid > 0) {
+            IERC20(address(_phUSD())).safeTransfer(msg.sender, phUSDPaid);
+        }
+    }
+
+    /**
+     * @dev Annihilate `annihilatable` antimatter against `netUsed` of `token` and return the phUSD
+     *      that ACTUALLY arrived, as a balance delta on this contract. Split out of
+     *      {_annihilateAndTopUp} purely to keep the stack within the legacy pipeline's limits — the
+     *      contract builds without via-ir on purpose.
+     *
+     *      `recipient` is `address(this)`, not the caller: that is what makes the delta measurable,
+     *      and measurement rather than arithmetic is the whole discipline of this path.
+     *      `minPhUSDOut` is `annihilatable + calculateMintAmount(token, netUsed)` — an EXACT floor on
+     *      what is actually being annihilated. Passing zero would waive Antimatter's only guard
+     *      against the exchange rate moving, or a mint cap biting, between this quote and the burn,
+     *      and would turn any such movement into silent extra inflation on the top-up above.
+     *
+     *      The approve/reset pattern around `annihilate` is load-bearing: Antimatter pulls the stable
+     *      half by `transferFrom`, and no standing allowance may survive the call.
+     */
+    function _annihilateMeasured(address token, uint256 netUsed, uint256 annihilatable, IPhusdStableMinter stableMinter)
+        internal
+        returns (uint256 delivered)
+    {
+        if (annihilatable == 0) {
+            return 0;
+        }
+        IERC20 phUSD = IERC20(address(_phUSD()));
+        uint256 balanceBefore = phUSD.balanceOf(address(this));
+        antimatter.mint(address(this), annihilatable);
+        IERC20(token).forceApprove(address(antimatter), netUsed);
+        antimatter.annihilate(
+            token, address(this), annihilatable, annihilatable + stableMinter.calculateMintAmount(token, netUsed)
+        );
+        IERC20(token).forceApprove(address(antimatter), 0);
+        delivered = phUSD.balanceOf(address(this)) - balanceBefore;
     }
 
     /**
@@ -1035,6 +1147,25 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
     }
 
     /**
+     * @notice The phUSD stable minter this staker prices the stablecoin half against, read LIVE off
+     *         Antimatter on every call.
+     * @dev The first hop of the two-hop read `antimatter.phUSDMinter()` ->
+     *      {IPhusdStableMinter-calculateMintAmount}, which is how {autoAnnihilate} learns what a
+     *      stable half is worth in phUSD and so sizes the frictionless payout it guarantees.
+     *
+     *      Not cached, for the same reason {phUSDToken} is not: `Antimatter.phUSDMinter` is mutable
+     *      and the owner may rotate it, so a cache would price against a dead minter after a
+     *      legitimate rotation — and Antimatter would then annihilate through the NEW one, making the
+     *      target and the delivery disagree silently.
+     *
+     *      Returns `address(0)` when Antimatter's minter is unset. Callers that intend to price a
+     *      real annihilation go through {_phUSDMinterContract}, which fails closed instead.
+     */
+    function phUSDMinterContract() public view returns (address) {
+        return antimatter.phUSDMinter();
+    }
+
+    /**
      * @notice True when this staker can actually mint phUSD right now.
      * @dev The gate on phUSD's `mint` has TWO conditions and the second is a live operational
      *      hazard: `canMint` must be set for this contract AND the `mintVersion` recorded at the
@@ -1136,6 +1267,16 @@ contract StableStakerV2 is Ownable, Pausable, ReentrancyGuard, IPausable, IStabl
         address token = phUSDToken();
         require(token != address(0), "StableStaker: phUSD unset on antimatter");
         return IPhUSD(token);
+    }
+
+    /// @dev Resolve the stable minter as {IPhusdStableMinter}, failing closed when Antimatter's minter
+    ///      is unset. {phUSDMinterContract} is the observable view and answers `address(0)`, which is
+    ///      the wrong answer for a caller about to price a payout against it: a call into address zero
+    ///      would revert with no message at all. Read live, per the reasoning on {phUSDMinterContract}.
+    function _phUSDMinterContract() internal view returns (IPhusdStableMinter) {
+        address stableMinter = phUSDMinterContract();
+        require(stableMinter != address(0), "StableStaker: phusd minter unset on antimatter");
+        return IPhusdStableMinter(stableMinter);
     }
 
     /// @dev The strategy is below par for the farm's position when its total balance (principal +

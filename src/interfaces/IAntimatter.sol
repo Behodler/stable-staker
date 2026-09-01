@@ -4,10 +4,13 @@ pragma solidity ^0.8.20;
 /**
  * @title IAntimatter
  * @notice Minimal view of the Antimatter emissions token that StableStakerV2 needs.
- * @dev StableStakerV2 touches Antimatter at five call sites: `mint` (claim, the terminal-migration
+ * @dev StableStakerV2 touches Antimatter at six call sites: `mint` (claim, the terminal-migration
  *      exit, and both halves of {StableStakerV2-autoAnnihilate}), `annihilate`, `toStableAmount`,
- *      and `phUSD` (read live by {StableStakerV2-phUSDToken} to resolve the token the staker may
- *      mint to cover an {StableStakerV2-autoAnnihilate} exit shortfall).
+ *      `phUSD` (read live by {StableStakerV2-phUSDToken} to resolve the token the staker may
+ *      mint to cover an {StableStakerV2-autoAnnihilate} exit shortfall), and `phUSDMinter` (read
+ *      live by {StableStakerV2-phUSDMinterContract}, the first hop of the two-hop read that lets
+ *      {StableStakerV2-autoAnnihilate} price the stablecoin half via
+ *      {IPhusdStableMinter-calculateMintAmount} and so size the frictionless payout it guarantees).
  *      Declaring the surface locally keeps `src/` free of the antimatter repo's transitive phUSD,
  *      phUSD-minter and pauser imports; the concrete `Antimatter` is deployed only in tests, against
  *      the `lib/antimatter` submodule.
@@ -58,4 +61,18 @@ interface IAntimatter {
      *      silently point at a dead token after a legitimate rotation.
      */
     function phUSD() external view returns (address);
+
+    /**
+     * @notice The phUSD stable minter Antimatter routes the stablecoin half of an annihilation through.
+     * @dev Declared as `address`, NOT as the concrete `PhusdStableMinter`: the ABI encoding of the
+     *      getter is identical, and `address` keeps this interface free of imports — exactly the
+     *      property the note above claims, and load-bearing here because `PhusdStableMinter` reaches
+     *      a THIRD level of submodule nesting through two relative imports. See {IPhusdStableMinter}.
+     *
+     *      On Antimatter the storage is `PhusdStableMinter public phUSDMinter;` and it is MUTABLE —
+     *      the owner may rotate it via `setPhUSDMinter`, which cross-checks phUSD and reverts
+     *      `PhUSDMinterMismatch` on disagreement. {StableStakerV2-phUSDMinterContract} therefore
+     *      reads it live and never caches it, for the same reason {StableStakerV2-phUSDToken} does.
+     */
+    function phUSDMinter() external view returns (address);
 }
