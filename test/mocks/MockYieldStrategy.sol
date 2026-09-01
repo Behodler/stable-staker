@@ -3,7 +3,6 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
 import "reflax-yield-vault/interfaces/IYieldStrategy.sol";
 
 /**
@@ -50,12 +49,6 @@ contract MockYieldStrategy is IYieldStrategy {
     ///         so every pre-existing test keeps its old behaviour byte for byte).
     uint256 public exitSlippageBps;
 
-    /// @notice Makes {previewExitFor} OVER-QUOTE `netGuaranteed` by this many basis points relative
-    ///         to what {withdraw} will actually deliver, without changing delivery. Models a
-    ///         manipulated or fee-blind preview (vault-RM 049: `convertToAssets` is the fee-free
-    ///         ideal conversion). 0 = honest preview.
-    uint256 public previewOverQuoteBps;
-
     constructor() {
         owner = msg.sender;
     }
@@ -87,12 +80,6 @@ contract MockYieldStrategy is IYieldStrategy {
     function setExitSlippageBps(uint256 bps) external {
         require(bps <= 10_000, "MockYieldStrategy: bps>MAX");
         exitSlippageBps = bps;
-    }
-
-    /// @notice Make {previewExitFor} lie upward about `netGuaranteed` by `bps`, leaving delivery
-    ///         untouched — the manipulated/over-quoting preview a consumer must defend against.
-    function setPreviewOverQuoteBps(uint256 bps) external {
-        previewOverQuoteBps = bps;
     }
 
     // ============ IYieldStrategy CORE ============
@@ -153,35 +140,6 @@ contract MockYieldStrategy is IYieldStrategy {
 
     function balanceOf(address token, address account) external view override returns (uint256) {
         return principal[token][account];
-    }
-
-    /// @notice vault-RM story 050 exit preview: the gross a caller must request to net `netWanted`,
-    ///         and the net that gross is guaranteed to deliver.
-    /// @dev Mirrors {withdraw}: gross-up by `exitSlippageBps`, cap at the account's principal exactly
-    ///      as `withdraw` caps it, then report the delivery for the CAPPED gross. `(0, 0)` at a 100%
-    ///      exit slippage, matching `ERC4626MarketYieldStrategy`'s division-by-zero guard.
-    ///      `previewOverQuoteBps` inflates ONLY the guarantee, never the delivery.
-    function previewExitFor(address token, address account, uint256 netWanted)
-        external
-        view
-        override
-        returns (uint256 grossToRequest, uint256 netGuaranteed)
-    {
-        uint256 denominator = 10_000 - exitSlippageBps;
-        if (denominator == 0) {
-            return (0, 0);
-        }
-        grossToRequest = Math.ceilDiv(netWanted * 10_000, denominator);
-        uint256 available = principal[token][account];
-        if (grossToRequest > available) {
-            grossToRequest = available;
-        }
-        // Mirror {withdraw} exactly, par cap first and exit haircut second, so an underwater
-        // strategy's preview agrees with its delivery instead of quietly over-quoting.
-        uint256 valued = (grossToRequest * valueFactorBps) / 10_000;
-        netGuaranteed = valued < grossToRequest ? valued : grossToRequest;
-        netGuaranteed = (netGuaranteed * denominator) / 10_000;
-        netGuaranteed = (netGuaranteed * (10_000 + previewOverQuoteBps)) / 10_000;
     }
 
     // ============ IYieldStrategy UNUSED-BY-STAKER STUBS ============

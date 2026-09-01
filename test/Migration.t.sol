@@ -967,20 +967,6 @@ contract UnderRealizingStrategy is IYieldStrategy {
         return principal[token][account];
     }
 
-    /// @dev vault-RM story 050 exit preview. Deliberately an HONEST-LOOKING identity quote even
-    ///      though {withdraw} realizes only half: this contract exists to model a vault that cannot
-    ///      exit atomically, and the mismatch is the point of the migration tests it serves.
-    function previewExitFor(address token, address account, uint256 netWanted)
-        external
-        view
-        override
-        returns (uint256 grossToRequest, uint256 netGuaranteed)
-    {
-        uint256 avail = principal[token][account];
-        grossToRequest = netWanted > avail ? avail : netWanted;
-        netGuaranteed = grossToRequest;
-    }
-
     function relinquishPrincipal(address, uint256) external override {}
     function relinquishPrincipalAsOwner(address, uint256) external override {}
     function emergencyWithdraw(uint256) external override {}

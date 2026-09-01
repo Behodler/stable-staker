@@ -40,7 +40,7 @@ contract AutoAnnihilateTest is Test {
     /// @dev A generous ceiling on "rounding-scale" for the 18-decimal DAI fixture, in antimatter
     ///      units. The real displacement is a couple of wei; anything approaching a haircut would
     ///      blow past this by many orders of magnitude.
-    uint256 internal constant EXIT_ROUNDING_ALLOWANCE_UNITS = 1e6;
+    uint256 internal constant ROUNDING_SCALE_CEILING = 1e6;
 
     /// @dev Mirrors {StableStakerV2.AutoAnnihilated} for vm.expectEmit.
     event AutoAnnihilated(
@@ -377,17 +377,21 @@ contract AutoAnnihilateTest is Test {
     }
 
     // ==================================================================================
-    // Round 2: exit-haircut sizing.
+    // Exit shortfall: measured, never quoted.
     //
     // Round 1 requested exactly the NET stable the annihilation needed and discarded
     // `_routeExit`'s return value, so a strategy that sells into an AMM on exit silently
-    // covered its own shortfall out of the shared underwater-withdrawal buffer. Round 2
-    // sizes the request with `IYieldStrategy.previewExitFor` (vault-RM story 050), debits
-    // the caller the GROSS the strategy gave up, and measures the real balance delta.
+    // covered its own shortfall out of the shared underwater-withdrawal buffer. What
+    // replaces it is not a quote but a measurement: the request is debited, the real
+    // balance delta is measured, and only what ARRIVED is ever approved and annihilated.
+    // The buffer is therefore untouchable by construction rather than by a floor check.
+    //
+    // INTERIM: the antimatter a shortfall displaces is still minted raw to the caller.
+    // Story 028 replaces that last step with a phUSD top-up.
     // ==================================================================================
 
-    /// @dev A strategy for DAI that sells on exit: principal is debited by the full gross request,
-    ///      only `gross * (10000 - bps) / 10000` is delivered.
+    /// @dev A strategy for DAI that sells on exit: principal is debited by the full request,
+    ///      only `request * (10000 - bps) / 10000` is delivered.
     function _haircutStrategy(uint256 bps) internal returns (MockYieldStrategy ys) {
         ys = new MockYieldStrategy();
         ys.setClient(address(staker), true);
@@ -401,7 +405,7 @@ contract AutoAnnihilateTest is Test {
         dai.mint(address(staker), 25 ether); // idle buffer: shared, and none of this call's business
         vm.warp(block.timestamp + 50);
 
-        // Byte-for-byte the round-1 figures: gross == net when the strategy takes no haircut.
+        // Byte-for-byte the round-1 figures: nothing is displaced when the exit delivers in full.
         vm.expectEmit(true, true, false, true, address(staker));
         emit AutoAnnihilated(address(dai), alice, 50 ether, 50 ether, 0);
         _autoAnnihilate(alice, address(dai), 0);
@@ -413,38 +417,14 @@ contract AutoAnnihilateTest is Test {
         assertEq(dai.balanceOf(address(staker)), 25 ether, "idle buffer untouched");
     }
 
-    function test_autoAnnihilate_haircutStrategy_debitsTheGrossNotTheNet() public {
-        MockYieldStrategy ys = _haircutStrategy(200);
-        _stake(alice, address(dai), 100 ether);
-        dai.mint(address(staker), 25 ether);
-        vm.warp(block.timestamp + 50);
-
-        uint256 owed = staker.claimableReward(address(dai), alice);
-        assertEq(owed, 50 ether, "precondition: owed");
-        (uint256 gross, uint256 net) = ys.previewExitFor(address(dai), address(staker), owed);
-        assertGt(gross, owed, "the gross-up is what the preview exists to supply");
-        assertGe(net, owed, "an uncapped gross-up still covers the whole annihilation");
-
-        vm.expectEmit(true, true, false, true, address(staker));
-        emit AutoAnnihilated(address(dai), alice, owed, gross, 0);
-        _autoAnnihilate(alice, address(dai), 0);
-
-        assertEq(_userAmount(address(dai), alice), 100 ether - gross, "user written down the GROSS");
-        assertEq(_totalStaked(address(dai)), 100 ether - gross, "totalStaked in lockstep with the gross");
-        assertEq(phUSD.balanceOf(alice), 2 * owed, "the whole reward was annihilated");
-        assertEq(antimatter.balanceOf(alice), 0, "nothing displaced while the principal cap is slack");
-        // Anything the exit over-delivered belongs to the caller, not to the shared buffer.
-        assertEq(dai.balanceOf(alice), 1_000_000 ether - 100 ether + (net - owed), "over-delivery returned");
-        assertEq(dai.balanceOf(address(staker)), 25 ether, "idle buffer untouched");
-    }
-
     function test_autoAnnihilate_wholePositionAgainstAHaircut_doesNotUnderflow() public {
         _haircutStrategy(200);
         _stake(alice, address(dai), 100 ether);
         vm.warp(block.timestamp + 100);
         assertEq(staker.claimableReward(address(dai), alice), 100 ether, "precondition: owed == principal");
 
-        // The story's worked example: gross-withdraw 100, receive 98, annihilate 98, mint 2.
+        // Withdraw 100, receive 98, annihilate 98, and the displaced 2 is minted raw (INTERIM:
+        // story 028 pays it as phUSD instead).
         vm.expectEmit(true, true, false, true, address(staker));
         emit AutoAnnihilated(address(dai), alice, 98 ether, 100 ether, 2 ether);
         _autoAnnihilate(alice, address(dai), 0);
@@ -452,7 +432,7 @@ contract AutoAnnihilateTest is Test {
         assertEq(_userAmount(address(dai), alice), 0, "whole position consumed, no underflow");
         assertEq(_totalStaked(address(dai)), 0, "totalStaked in lockstep");
         assertEq(staker.stakerCount(address(dai)), 0, "staker removed from the set");
-        assertEq(antimatter.balanceOf(alice), 2 ether, "haircut-displaced antimatter minted to the caller");
+        assertEq(antimatter.balanceOf(alice), 2 ether, "shortfall-displaced antimatter minted to the caller");
         assertEq(phUSD.balanceOf(alice), 196 ether, "both halves of the 98 that survived the exit");
         assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
     }
@@ -461,56 +441,63 @@ contract AutoAnnihilateTest is Test {
         uint256[3] memory tolerances = [uint256(0), 500, 2_000];
         for (uint256 i = 0; i < tolerances.length; i++) {
             uint256 snap = vm.snapshotState();
-            MockYieldStrategy ys = _haircutStrategy(tolerances[i]);
+            _haircutStrategy(tolerances[i]);
             _stake(alice, address(dai), 100 ether);
             vm.warp(block.timestamp + 100); // owed == principal: the cap binds at every tolerance
 
-            (uint256 gross, uint256 net) = ys.previewExitFor(address(dai), address(staker), 100 ether);
-            assertEq(gross, 100 ether, "the account's principal caps the gross");
+            // What the exit will actually deliver for a 100-ether request, computed from the knob
+            // rather than asked of the strategy: there is no quote to ask for any more.
+            uint256 net = (100 ether * (10_000 - tolerances[i])) / 10_000;
 
             _autoAnnihilate(alice, address(dai), 0);
 
-            assertEq(_userAmount(address(dai), alice), 0, "debited the GROSS");
+            assertEq(_userAmount(address(dai), alice), 0, "debited the request");
             assertEq(_totalStaked(address(dai)), 0, "totalStaked in lockstep");
-            assertEq(phUSD.balanceOf(alice), 2 * net, "annihilated the NET the gross yielded");
+            assertEq(phUSD.balanceOf(alice), 2 * net, "annihilated the NET that actually arrived");
             assertEq(antimatter.balanceOf(alice), 100 ether - net, "the displaced remainder is minted");
             assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
             vm.revertToState(snap);
         }
     }
 
-    function test_autoAnnihilate_lyingPreview_revertsAndNeverDrawsOnTheBuffer() public {
-        MockYieldStrategy ys = _haircutStrategy(200);
-        ys.setPreviewOverQuoteBps(500); // guarantees 5% more than it will deliver
-        _stake(alice, address(dai), 100 ether);
-        dai.mint(address(staker), 500 ether); // a fat buffer the shortfall must not reach
-        vm.warp(block.timestamp + 50);
+    /// @dev THE invariant the deleted shortfall floor existed to protect, asserted directly. The
+    ///      idle stable balance is the SHARED underwater-withdrawal buffer; `autoAnnihilate` must
+    ///      never spend a unit of it, whatever the exit delivers. It now holds by construction —
+    ///      only the measured `netUsed` is ever approved and annihilated — so it is asserted across
+    ///      the full-credit, haircut and whole-position cases against a deliberately fat buffer.
+    function test_autoAnnihilate_neverDrawsOnTheIdleBuffer() public {
+        uint256[3] memory tolerances = [uint256(0), 200, 5_000];
+        uint256[2] memory warps = [uint256(50), 100]; // partial position, then the whole position
+        for (uint256 i = 0; i < tolerances.length; i++) {
+            for (uint256 j = 0; j < warps.length; j++) {
+                uint256 snap = vm.snapshotState();
+                _haircutStrategy(tolerances[i]);
+                _stake(alice, address(dai), 100 ether);
+                dai.mint(address(staker), 500 ether); // a fat buffer the shortfall must not reach
+                vm.warp(block.timestamp + warps[j]);
 
-        vm.prank(alice);
-        vm.expectRevert(bytes("StableStaker: exit shortfall"));
-        staker.autoAnnihilate(address(dai), 0);
+                _autoAnnihilate(alice, address(dai), 0);
 
-        assertEq(dai.balanceOf(address(staker)), 500 ether, "buffer untouched");
-        assertEq(_userAmount(address(dai), alice), 100 ether, "no partial fill");
-        assertEq(antimatter.balanceOf(alice), 0, "no partial fill");
-    }
-
-    function test_autoAnnihilate_strategyThatGuaranteesNothing_isUnavailable() public {
-        _haircutStrategy(10_000); // 100% tolerance: previewExitFor answers (0, 0)
-        _stake(alice, address(dai), 100 ether);
-        vm.warp(block.timestamp + 50);
-
-        assertFalse(staker.autoAnnihilateAvailable(address(dai)), "view agrees with the call");
-        vm.prank(alice);
-        vm.expectRevert(bytes("StableStaker: token not annihilatable"));
-        staker.autoAnnihilate(address(dai), 0);
+                assertEq(dai.balanceOf(address(staker)), 500 ether, "buffer untouched");
+                vm.revertToState(snap);
+            }
+        }
     }
 
     function test_autoAnnihilateAvailable_staysTrueForAWorkingStrategy() public {
+        // The only surviving condition is the stable-minter registration probe, so the strategy's
+        // exit behaviour — however punishing — can no longer make the call unavailable.
+        // Both swaps happen while the pool is empty, which is the only time setYieldStrategy allows one.
+        _haircutStrategy(10_000); // delivers nothing at all: round 2 reported false here
+        assertTrue(staker.autoAnnihilateAvailable(address(dai)), "delivery is measured, never pre-judged");
+
         _haircutStrategy(200);
-        assertTrue(staker.autoAnnihilateAvailable(address(dai)), "empty pool: nothing to guarantee yet");
+        assertTrue(staker.autoAnnihilateAvailable(address(dai)), "empty pool");
         _stake(alice, address(dai), 100 ether);
         assertTrue(staker.autoAnnihilateAvailable(address(dai)), "funded pool with a survivable haircut");
+
+        // ...while a pool token the minter does not know still reports false.
+        assertFalse(staker.autoAnnihilateAvailable(address(orphan)), "unregistered token");
     }
 
     // --------------------------------------- the production ERC4626 strategy (rounding)
@@ -534,36 +521,34 @@ contract AutoAnnihilateTest is Test {
         vault.accrue(yieldAssets);
     }
 
+    /// @dev The property that matters and must outlive round 2: a REAL ERC4626 at a non-integral
+    ///      share price does not revert. Round 2 demanded delivery within a rounding allowance of a
+    ///      quoted floor; there is no floor any more, so the double round-down is simply measured.
     function test_autoAnnihilate_realERC4626Strategy_roundingDoesNotRevert() public {
         // A share price of 100 / 97 — deliberately not a whole number of asset units per share.
-        ERC4626YieldStrategy ys = _erc4626Strategy(100 ether, 97 ether);
+        _erc4626Strategy(100 ether, 97 ether);
         vm.warp(block.timestamp + 50);
 
         uint256 owed = staker.claimableReward(address(dai), alice);
         assertEq(owed, 50 ether, "precondition: owed");
-        (uint256 gross, uint256 net) = ys.previewExitFor(address(dai), address(staker), owed);
-        assertEq(gross, owed, "the default preview is the capped identity");
-        assertEq(net, gross, "...and it guarantees the full gross, which the vault cannot quite pay");
 
-        // Round 2 demanded delivery >= gross to the wei, which this strategy cannot meet.
         _autoAnnihilate(alice, address(dai), 0);
 
-        assertEq(_userAmount(address(dai), alice), 100 ether - gross, "written down the GROSS");
-        assertEq(_totalStaked(address(dai)), 100 ether - gross, "totalStaked in lockstep");
+        assertEq(_userAmount(address(dai), alice), 100 ether - owed, "written down the request");
+        assertEq(_totalStaked(address(dai)), 100 ether - owed, "totalStaked in lockstep");
         // The caller absorbs the rounding: whatever the exit could not deliver comes back as raw
-        // Antimatter rather than as an annihilated half, exactly as a real haircut does. It is a
-        // handful of wei, not a haircut — the point is that the call SUCCEEDS and conserves.
+        // Antimatter rather than as an annihilated half. It is a handful of wei, not a haircut —
+        // the point is that the call SUCCEEDS and conserves.
         uint256 raw = antimatter.balanceOf(alice);
         assertGt(raw, 0, "the double round-down really did displace something");
-        assertLe(raw, EXIT_ROUNDING_ALLOWANCE_UNITS, "and it is rounding-scale, not haircut-scale");
+        assertLe(raw, ROUNDING_SCALE_CEILING, "and it is rounding-scale, not haircut-scale");
         assertEq(phUSD.balanceOf(alice), 2 * (owed - raw), "both halves of what survived the exit");
         assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
     }
 
     function test_autoAnnihilate_realERC4626Strategy_wholePosition_succeeds() public {
-        ERC4626YieldStrategy ys = _erc4626Strategy(100 ether, 97 ether);
-        ys; // silence unused
-        vm.warp(block.timestamp + 100); // owed == principal: the GROSS cap binds
+        _erc4626Strategy(100 ether, 97 ether);
+        vm.warp(block.timestamp + 100); // owed == principal: the principal cap binds
 
         _autoAnnihilate(alice, address(dai), 0);
 
@@ -571,21 +556,5 @@ contract AutoAnnihilateTest is Test {
         assertEq(_totalStaked(address(dai)), 0, "totalStaked in lockstep");
         assertEq(staker.stakerCount(address(dai)), 0, "staker removed from the set");
         assertEq(dai.balanceOf(address(staker)), 0, "idle buffer untouched");
-    }
-
-    /// @dev The tolerance is for ROUNDING, not for a haircut: a strategy that under-delivers by a
-    ///      material margin must still fail the call rather than mint the shortfall raw.
-    function test_autoAnnihilate_materialShortfall_stillReverts() public {
-        MockYieldStrategy ys = _haircutStrategy(200);
-        ys.setPreviewOverQuoteBps(10); // 0.1% over-quote: far above the rounding allowance
-        _stake(alice, address(dai), 100 ether);
-        dai.mint(address(staker), 500 ether);
-        vm.warp(block.timestamp + 50);
-
-        vm.prank(alice);
-        vm.expectRevert(bytes("StableStaker: exit shortfall"));
-        staker.autoAnnihilate(address(dai), 0);
-
-        assertEq(dai.balanceOf(address(staker)), 500 ether, "buffer untouched");
     }
 }
